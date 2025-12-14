@@ -3,6 +3,10 @@ title: "ndd-perturb-ipsc"
 author: "Daniel Brock"
 date: "2025-08-27"
 output: html_document
+
+### Forked Repo
+# Edit by Yifan Chen
+# 12-13-2025
 ---
 
 
@@ -32,7 +36,7 @@ library(WGCNA)
 library(hdWGCNA)
 
 # Setting the file path to the 10X files
-dir_10x <- "/mnt/mass_storage1/mass_storage_projects/compass/"
+dir_10x <- "/home/rdhin/data/perturbed-compass-10x/COM-iN-none-aggr/"
 
 # Setting hdWGCNA threads
 enableWGCNAThreads(nThreads = 10)
@@ -47,7 +51,7 @@ enableWGCNAThreads(nThreads = 10)
 
 ```{r}
 # Importing 10X output - 
-mats <- Read10X(data.dir = "/mnt/mass_storage1/mass_storage_projects/compass/COM-iP-none-aggr/count/batch1")
+mats <- Read10X(data.dir = "/home/rdhin/data/perturbed-compass-10x/COM-iN-none-aggr/")
 print(names(mats))
 ```
 
