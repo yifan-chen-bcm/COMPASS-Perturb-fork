@@ -322,6 +322,9 @@ ggsave(plot = tSNE, filename = "iPSC_figures_fork/tSNE_plot_by_gene.png", width 
 qs_save(object = so, file = paste0(getwd(), "/data/1_COMPASS-iPSC-gRNA-QC.qs2"))
 ```
 
+```{r}
+so <- qs_read(file = paste0(getwd(), "/data/1_COMPASS-iPSC-gRNA-QC.qs2"))
+```
 
 # 6. Number of cells per gRNA to plot synthetic lethality
 
@@ -370,61 +373,278 @@ print(indiv_gRNA_plot)
 ggsave(plot = indiv_gRNA_plot, filename = "iPSC_figures_fork/gRNA_assignment_counts.png", width = 2000, height = 1500, dpi = 300, units = "px")
 ```
 
-# 7. DEG between each guide and NTC to drop off guide that doesn't perturb target gene expression by 30%
+## 6.1 Plot cell counts of each guide per gene compared to NTC
 
 ```{r}
-list_of_guides <- grep("^NTC", unique(so@meta.data$gRNA), value = TRUE, invert = TRUE)
-guide_kd_result <- list()
+list_of_genes <- unique(indiv_gRNA_counts[indiv_gRNA_counts$gene != "NTC", ]$gene)
 
-pb <- progress_bar$new(
-  format = "  Testing Guides [:bar] :percent | Elapsed: :elapsed | ETA: :eta",
-  total = length(list_of_guides),
-  clear = FALSE,
-  width = 100
-)
+# group all NTC cells together
+average_ntc_cell_counts <- mean(indiv_gRNA_counts[indiv_gRNA_counts$gene == "NTC", ]$cell_counts)
+sem_ntc_cell_counts <- sem(indiv_gRNA_counts[indiv_gRNA_counts$gene == "NTC", ]$cell_counts)
 
-for (guide in list_of_guides) {
-  target_gene <- unique(so@meta.data$target_gene_name[so@meta.data$gRNA == guide])
-  so_sub <- subset(so, subset = NT_gRNA == "non-targeting" | gRNA == guide)
+# add a new line in the df
+indiv_gRNA_counts <- indiv_gRNA_counts %>% ungroup() %>% 
+  dplyr::add_row(gRNA = "NT", gene = "NT", replicate = "NTC",
+                                                          cell_counts = average_ntc_cell_counts,
+                                                          mean_cell_counts = average_ntc_cell_counts,
+                                                          sem_cell_counts = sem_ntc_cell_counts)
+
+correct_order <- c("NTC", paste0("g", 1:20))
+gene_plot_list <- list()
+
+for (gene_plot in list_of_genes) {
   
-  n_cells <- sum(so_sub$gRNA == guide)
-  if (n_cells < 4) {
-      # Print the name of the failing guide
-      message(paste("\nSkipping:", guide, "- Too few cells ( Count =", n_cells, ")"))
-      
-      # Tick progress bar so it doesn't get stuck
-      if (!pb$finished) pb$tick()
-      next # Skip to next iteration immediately
-  }
+  plot <- indiv_gRNA_counts %>% dplyr::filter(gene == gene_plot | gene == "NT")
+  plot$replicate <- factor(plot$replicate, levels = correct_order)
+  gRNA_cell_plot <- ggplot(plot, aes(x = replicate, y=cell_counts)) +
+    geom_col(aes(fill = replicate == "NTC")) +
+    scale_fill_manual(values = c("FALSE" = "grey40", "TRUE" = "lightblue"), guide = "none") +
+    geom_errorbar(
+      # Only pass the NTC rows to this specific layer
+      data = subset(plot, replicate == "NTC"), 
+      aes(
+        ymin = cell_counts - sem_cell_counts, 
+        ymax = cell_counts + sem_cell_counts
+      ),
+      width = 0.2 
+    )+
+    scale_y_continuous(expand = c(0, 0)) + 
+    labs(x = "Guide", y = "Cell Counts", title = paste0(gene_plot, " gRNA Assignment per Cell")) + 
+    theme_classic() + 
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
   
-  so_sub$comparison_group <- ifelse(so_sub$gRNA == guide, "Knockdown", "Control")
-  Idents(so_sub) <- "comparison_group"
-  deg <- FindMarkers(so_sub, 
-                       ident.1 = "Knockdown", 
-                       ident.2 = "Control", 
-                       features = target_gene, # only test the target gene
-                       test.use = "MAST", 
-                       logfc.threshold = 0,
-                       min.pct = 0,
-                       verbose = FALSE)
   
-  deg$guide_name <- guide
-  deg$target_gene <- target_gene
-  deg$cell_count <- n_cells
-  guide_kd_result[[guide]] <- deg
-  
-  if (!pb$finished) {
-    pb$tick()
-  }
-  
+   gene_plot_list[[gene_plot]] <- gRNA_cell_plot
 }
 
-gRNA_knockdown_summary <- do.call(rbind, guide_kd_result)
+# save all figures in folder
+dir.create("iPSC_figures_fork/gRNA_cell_counts", showWarnings = FALSE)
 
-# save the table
-write_xlsx(gRNA_knockdown_summary, path = "iPSC_figures_fork/gRNA_knockdown_summary.xlsx")
+# Loop through each gene in the list
+for (gene_name in names(gene_plot_list)) {
+  
+  # 1. Retrieve the plot object
+  current_plot <- gene_plot_list[[gene_name]]
+  
+  # 2. Create a dynamic filename (e.g., "gRNA_Plots/KDM6A_counts.pdf")
+  file_name <- paste0("iPSC_figures_fork/gRNA_cell_counts/", gene_name, "_gRNA_cell_counts.png")
+  
+  # 3. Save the plot
+  # width and height are in inches by default
+  ggsave(filename = file_name, plot = current_plot, width = 2000, height = 1500, dpi = 300, units = "px")
+  
+  print(paste("Saved:", file_name))
+}
+
+
 ```
 
+
+# 7. Perfrom pair-wise Spearman correlation among NTC guides to check off targeting of NT guides
+
+```{r}
+so_ntc <- subset(so, subset = NT_gRNA == "non-targeting")
+
+list_of_NT_gRNA <- unique(so_ntc@meta.data$gRNA)
+Idents(so_ntc) <- "gRNA"
+# set the order correct
+ntc_guides <- str_sort(unique(so_ntc@meta.data$gRNA), numeric = TRUE)
+
+# calculate average gene expression of all cells receiving the same guide
+avg_expression <- AverageExpression(so_ntc, assays = "RNA", slot = "data")$RNA
+
+# find variable features, default 2000
+so_ntc <- FindVariableFeatures(so_ntc, nfeatures = 2000)
+genes_to_use <- VariableFeatures(so_ntc)
+avg_expression_subset <- avg_expression[genes_to_use, ]
+
+cor_mat <- cor(as.matrix(avg_expression_subset), method = "spearman")
+cor_mat <- cor_mat[ntc_guides, ntc_guides] # set order of the matrix
+
+# plot spearman correlation
+
+ntc_spearman_cor <- pheatmap(
+  cor_mat, 
+  main = "Spearman Correlation of NT Guides",
+  display_numbers = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(0.8, 1, length.out = 101),
+  cluster_rows = FALSE, 
+  cluster_cols = FALSE
+)
+
+ggsave(filename = "iPSC_figures_fork/NTC_Spearman_Correlation.png", plot = ntc_spearman_cor, width = 2000, height = 1500, dpi = 300, units = "px")
+
+```
+
+## 7.1 Perfrom pair-wise DEG among NT guides
+
+```{r}
+### Compare one NT guide against the rest of NTC combined
+
+# Create a container to store results
+deg_counts <- data.frame(
+  Comparison = character(),
+  Total = numeric(),
+  Genes = character(),
+  stringsAsFactors = FALSE
+)
+
+
+for (id in ntc_guides) {
+  message(paste("Processing:", id, "vs remaining NTCs..."))
+  
+  rest_of_ntcs <- setdiff(ntc_guides, id)
+  
+  try({
+    markers <- FindMarkers(
+      so_ntc,
+      ident.1 = id,
+      ident.2 = rest_of_ntcs,
+      min.pct = 0.1,
+      logfc.threshold = 0.25,
+      test.use = "wilcox",
+      verbose = FALSE
+    )
+    
+    sig_markers <- markers[markers$p_val_adj < 0.05, ]
+    
+    num_degs <- nrow(sig_markers)
+    gene_list_str <- paste(rownames(sig_markers), collapse = ", ")
+
+    deg_counts <- rbind(deg_counts, data.frame(
+      Comparison = id,
+      Total = num_degs,
+      Genes = gene_list_str
+    ))
+    
+  }, silent = TRUE)
+}
+
+print(deg_counts)
+
+
+#### Correlation matrix style of DEG, performing pair-wise DEGs
+deg_matrix <- matrix(0, nrow = length(ntc_guides), ncol = length(ntc_guides))
+rownames(deg_matrix) <- ntc_guides
+colnames(deg_matrix) <- ntc_guides
+
+for (i in ntc_guides) {
+  for (j in ntc_guides) {
+    
+    if (i == j) {
+      deg_matrix[i, j] <- 0
+      next
+    }
+    
+
+    message(paste("Comparing:", i, "vs", j))
+    
+    # Run FindMarkers with error handling
+    try({
+      markers <- FindMarkers(
+        so_ntc,
+        ident.1 = i,
+        ident.2 = j,
+        min.pct = 0.1,
+        logfc.threshold = 0.25,
+        test.use = "wilcox",
+        verbose = FALSE
+      )
+      
+      n_sig <- sum(markers$p_val_adj < 0.05)
+      deg_matrix[i, j] <- n_sig
+      
+    }, silent = TRUE)
+  }
+}
+
+# plot the matrix
+heat_map <- pheatmap(
+  deg_matrix,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE, # Show the actual count inside the square
+  number_format = "%.0f", # No decimals
+  color = colorRampPalette(c("white", "red"))(50),
+  main = "Pairwise DEGs between NTC Guides"
+)
+
+ggsave(filename = "iPSC_figures_fork/NTC_DEG_heatmap.png", plot = heat_map, width = 2000, height = 1500, dpi = 300, units = "px")
+
+
+# check the gene of interest
+rest_of_ntcs <- setdiff(list_of_NT_gRNA, "NTC-g9")
+markers <- FindMarkers(
+        so_ntc,
+        ident.1 = "NTC-g9",
+        ident.2 = rest_of_ntcs,
+        min.pct = 0.1,
+        logfc.threshold = 0.25,
+        test.use = "wilcox",
+        verbose = FALSE)
+```
+
+
+
+# 8. DEG between each guide and NTC to drop off guide that doesn't perturb target gene expression by 30%
+
+```{r}
+# list_of_guides <- grep("^NTC", unique(so@meta.data$gRNA), value = TRUE, invert = TRUE)
+# guide_kd_result <- list()
+# 
+# pb <- progress_bar$new(
+#   format = "  Testing Guides [:bar] :percent | Elapsed: :elapsed | ETA: :eta",
+#   total = length(list_of_guides),
+#   clear = FALSE,
+#   width = 100
+# )
+# 
+# for (guide in list_of_guides) {
+#   target_gene <- unique(so@meta.data$target_gene_name[so@meta.data$gRNA == guide])
+#   so_sub <- subset(so, subset = NT_gRNA == "non-targeting" | gRNA == guide)
+#   
+#   n_cells <- sum(so_sub$gRNA == guide)
+#   if (n_cells < 4) {
+#       # Print the name of the failing guide
+#       message(paste("\nSkipping:", guide, "- Too few cells ( Count =", n_cells, ")"))
+#       
+#       # Tick progress bar so it doesn't get stuck
+#       if (!pb$finished) pb$tick()
+#       next # Skip to next iteration immediately
+#   }
+#   
+#   so_sub$comparison_group <- ifelse(so_sub$gRNA == guide, "Knockdown", "Control")
+#   Idents(so_sub) <- "comparison_group"
+#   deg <- FindMarkers(so_sub, 
+#                        ident.1 = "Knockdown", 
+#                        ident.2 = "Control", 
+#                        features = target_gene, # only test the target gene
+#                        test.use = "MAST", 
+#                        logfc.threshold = 0,
+#                        min.pct = 0,
+#                        verbose = FALSE)
+#   
+#   deg$guide_name <- guide
+#   deg$target_gene <- target_gene
+#   deg$cell_count <- n_cells
+#   guide_kd_result[[guide]] <- deg
+#   
+#   if (!pb$finished) {
+#     pb$tick()
+#   }
+#   
+# }
+# 
+# gRNA_knockdown_summary <- do.call(rbind, guide_kd_result)
+# 
+# # save the table
+# write_xlsx(gRNA_knockdown_summary, path = "iPSC_figures_fork/gRNA_knockdown_summary.xlsx")
+```
+
+## 8.1 Extract cell expression using matrix data and perform fast wilcox.test only on the target gene expression, filter out guide with <20 cells
 
 ```{r}
 # Perfrom the same calculation using matrix
@@ -488,11 +708,52 @@ for (guide in list_of_guides) {
 
 gRNA_knockdown_summary_matrix <- do.call(rbind, guide_kd_result)
 
-
+# Save file
+write_xlsx(gRNA_knockdown_summary_matrix, path = "iPSC_figures_fork/gRNA_knockdown_summary.xlsx")
 
 ```
 
 
+## 8.2 Subset the Seurat object with only guide pass logFC filter
+
+```{r}
+gRNA_knockdown_summary_matrix <- gRNA_knockdown_summary_matrix %>% 
+  dplyr::filter(avg_log2FC < log2(0.7) & p_val < 0.05)
+
+# check guide left for each gene
+table(gRNA_knockdown_summary_matrix$target_gene)
+
+# extract a list of working guides
+logFC_filter_guide <- gRNA_knockdown_summary_matrix$guide_name
+
+# Subset Seurat object to contain only logFC filter guide and NTC
+so_logFC_filter <- subset(so, subset = NT_gRNA == "non-targeting" | gRNA %in% logFC_filter_guide)
+
+# Redo UMAP and PCA from this reduced dataset 
+so_logFC_filter <- FindVariableFeatures(so_logFC_filter, selection.method = "vst", nfeatures = 2000)
+so_logFC_filter <- ScaleData(so_logFC_filter)
+so_logFC_filter <- RunPCA(so_logFC_filter, verbose = FALSE)
+elbow_so_logFC_filter <- ElbowPlot(so_logFC_filter)
+print(elbow_so_logFC_filter)
+
+so_logFC_filter <- RunUMAP(so_logFC_filter, dims = 1:15)
+logFC_UMAP <- DimPlot(so_logFC_filter, reduction = "umap", group.by = "target_gene_name") + ggtitle("UMAP after guide-logFC filter")
+ggsave(plot = logFC_UMAP, filename = "iPSC_figures_fork/UMAP_plot_by_gene_after_logFC_filter.png", width = 3000, height = 2000, dpi = 300, units = "px")
+
+
+
+so_logFC_filter <- RunICA(so_logFC_filter, features = VariableFeatures(so_logFC_filter), nics = 50)
+so_logFC_filter <- RunTSNE(so_logFC_filter, reduction = "ica", dims = 1:30)
+tSNE <- DimPlot(so_logFC_filter, reduction = "tsne", group.by = "target_gene_name") + ggtitle("t-SNE after guide-logFC filter")
+
+ggsave(plot = tSNE, filename = "iPSC_figures_fork/tSNE_plot_by_gene_after_logFC_filter.png", width = 3000, height = 2000, dpi = 300, units = "px")
+
+```
+
+```{r}
+# Saving the logFC-filtered seurat object
+qs_save(object = so_logFC_filter, file = paste0(getwd(), "/data/2_COMPASS-iPSC-gRNA-logFC-filtered.qs2"))
+```
 
 
 # 8. Mixscale per gRNA
