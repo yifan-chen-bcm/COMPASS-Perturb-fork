@@ -44,7 +44,7 @@ dir_10x <- "/home/rdhin/data/perturbed-compass-10x/COM-iP-none-aggr/"
 
 ```{r}
 # Importing 10X output (unzipped folder containing barcodes/features/matrix) - 
-mats <- Read10X(data.dir = paste0(dir_10x, "count/reads")) # loading file is much slower on RStudio Server due to IO speed limit
+mats <- Read10X(data.dir = paste0(dir_10x, "count/reads")) 
 print(names(mats))
 ```
 
@@ -76,9 +76,9 @@ grna.calls <- read.csv(file = paste0(dir_10x, "count/crispr_reads/protospacer_ca
 
 ```
 
-```{r}
-### gRNA per cell graphs
+## 2.2 Plot gRNA per cell 
 
+```{r}
 # Histogram of gRNA calls
 num.grna.calls <- table(grna.calls$num_features) %>% as.data.frame()
 num.grna.calls$Var1 <- as.numeric(num.grna.calls$Var1)
@@ -112,7 +112,7 @@ print(num.grna.hist)
 ggsave(plot = num.grna.hist, filename = "iPSC_figures_fork/guide_counts_histogram.png", width = 3000, height = 2000, units = "px", dpi = 300)
 ```
 
-## 2.2 Filtering for cells that got 1 gRNA and adding gRNA metadata
+## 2.3 Filtering for cells that got 1 gRNA and adding gRNA metadata
 
 ```{r}
 # Filtering for cells that only got 1 gRNA and adding metadata for gRNAs
@@ -156,7 +156,7 @@ meta <- so@meta.data
 
 ```{r}
 # nFeatures
-p1_qlow <- quantile(x = so$nFeature_RNA, 0.05)
+p1_qlow <- quantile(x = so$nFeature_RNA, 0.05) # here we use top and bottom 5% cutoff
 p1_qhigh <- quantile(x = so$nFeature_RNA, 0.95)
 p1 <- VlnPlot(object = so, 
               features = c("nFeature_RNA"),
@@ -184,7 +184,7 @@ p3 <- VlnPlot(object = so,
               pt.size = 0, 
               cols = c("#037bfc", "#037bfc", "#037bfc")) +
   NoLegend() +
-  geom_hline(yintercept = 10, linetype = "dashed", color = "red")+
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red")+ # here we use 10% MT DNA cutoff
   theme(axis.text.x = element_blank(), 
         axis.ticks.x = element_blank())+
   xlab(NULL)
@@ -218,9 +218,9 @@ ggsave(plot = qc_scatter, filename = "iPSC_figures_fork/qc_scatter_after_filteri
 ## 3.3 Filtering on QC metrics
 
 ```{r}
-#### Apply filter matrix here - using 5% percentage mt as cutoff
+#### Apply filter matrix here
 n_before <- ncol(so)
-so <- subset(so, subset = nFeature_RNA > p1_qlow & nFeature_RNA < p1_qhigh & percent.mt < 10)
+so <- subset(so, subset = nFeature_RNA > p1_qlow & nFeature_RNA < p1_qhigh & percent.mt < 10) # here we use 10% MT DNA cutoff
 
 # Count cells after
 n_after <- ncol(so)
@@ -453,7 +453,7 @@ Idents(so_ntc) <- "gRNA"
 ntc_guides <- str_sort(unique(so_ntc@meta.data$gRNA), numeric = TRUE)
 
 # calculate average gene expression of all cells receiving the same guide
-avg_expression <- AverageExpression(so_ntc, assays = "RNA", slot = "data")$RNA
+avg_expression <- AggregateExpression(so_ntc, assays = "RNA", slot = "data")$RNA
 
 # find variable features, default 2000
 so_ntc <- FindVariableFeatures(so_ntc, nfeatures = 2000)
@@ -479,10 +479,9 @@ ggsave(filename = "iPSC_figures_fork/NTC_Spearman_Correlation.png", plot = ntc_s
 
 ```
 
-## 7.1 Perfrom pair-wise DEG among NT guides
+## 7.1 Perfrom DEG of one NT guide against the rest of NT guides
 
 ```{r}
-### Compare one NT guide against the rest of NTC combined
 
 # Create a container to store results
 deg_counts <- data.frame(
@@ -504,13 +503,16 @@ for (id in ntc_guides) {
       ident.1 = id,
       ident.2 = rest_of_ntcs,
       min.pct = 0.1,
-      logfc.threshold = 0.25,
+      logfc.threshold = 0,
       test.use = "wilcox",
       verbose = FALSE
     )
     
-    sig_markers <- markers[markers$p_val_adj < 0.05, ]
-    
+    markers$p_val_adj_fdr <- p.adjust(markers$p_val, method = "fdr")
+
+    sig_markers <- markers %>% 
+      dplyr::filter(p_val_adj_fdr < 0.05)
+
     num_degs <- nrow(sig_markers)
     gene_list_str <- paste(rownames(sig_markers), collapse = ", ")
 
@@ -525,8 +527,13 @@ for (id in ntc_guides) {
 
 print(deg_counts)
 
+```
 
-#### Correlation matrix style of DEG, performing pair-wise DEGs
+
+## 7.2 Perform pair-wise DEG among all pairs of guides
+
+```{r}
+
 deg_matrix <- matrix(0, nrow = length(ntc_guides), ncol = length(ntc_guides))
 rownames(deg_matrix) <- ntc_guides
 colnames(deg_matrix) <- ntc_guides
@@ -549,12 +556,17 @@ for (i in ntc_guides) {
         ident.1 = i,
         ident.2 = j,
         min.pct = 0.1,
-        logfc.threshold = 0.25,
+        logfc.threshold = 0,
         test.use = "wilcox",
         verbose = FALSE
       )
+      markers$p_val_adj_fdr <- p.adjust(markers$p_val, method = "fdr")
+
+      sig_markers <- markers %>% 
+        dplyr::filter(p_val_adj_fdr < 0.05)%>% 
+        dplyr::filter(pct.1 > 0.1 | pct.2 > 0.1)
       
-      n_sig <- sum(markers$p_val_adj < 0.05)
+      n_sig <- nrow(sig_markers)
       deg_matrix[i, j] <- n_sig
       
     }, silent = TRUE)
@@ -591,63 +603,11 @@ markers <- FindMarkers(
 
 # 8. DEG between each guide and NTC to drop off guide that doesn't perturb target gene expression by 30%
 
-```{r}
-# list_of_guides <- grep("^NTC", unique(so@meta.data$gRNA), value = TRUE, invert = TRUE)
-# guide_kd_result <- list()
-# 
-# pb <- progress_bar$new(
-#   format = "  Testing Guides [:bar] :percent | Elapsed: :elapsed | ETA: :eta",
-#   total = length(list_of_guides),
-#   clear = FALSE,
-#   width = 100
-# )
-# 
-# for (guide in list_of_guides) {
-#   target_gene <- unique(so@meta.data$target_gene_name[so@meta.data$gRNA == guide])
-#   so_sub <- subset(so, subset = NT_gRNA == "non-targeting" | gRNA == guide)
-#   
-#   n_cells <- sum(so_sub$gRNA == guide)
-#   if (n_cells < 4) {
-#       # Print the name of the failing guide
-#       message(paste("\nSkipping:", guide, "- Too few cells ( Count =", n_cells, ")"))
-#       
-#       # Tick progress bar so it doesn't get stuck
-#       if (!pb$finished) pb$tick()
-#       next # Skip to next iteration immediately
-#   }
-#   
-#   so_sub$comparison_group <- ifelse(so_sub$gRNA == guide, "Knockdown", "Control")
-#   Idents(so_sub) <- "comparison_group"
-#   deg <- FindMarkers(so_sub, 
-#                        ident.1 = "Knockdown", 
-#                        ident.2 = "Control", 
-#                        features = target_gene, # only test the target gene
-#                        test.use = "MAST", 
-#                        logfc.threshold = 0,
-#                        min.pct = 0,
-#                        verbose = FALSE)
-#   
-#   deg$guide_name <- guide
-#   deg$target_gene <- target_gene
-#   deg$cell_count <- n_cells
-#   guide_kd_result[[guide]] <- deg
-#   
-#   if (!pb$finished) {
-#     pb$tick()
-#   }
-#   
-# }
-# 
-# gRNA_knockdown_summary <- do.call(rbind, guide_kd_result)
-# 
-# # save the table
-# write_xlsx(gRNA_knockdown_summary, path = "iPSC_figures_fork/gRNA_knockdown_summary.xlsx")
-```
 
 ## 8.1 Extract cell expression using matrix data and perform fast wilcox.test only on the target gene expression, filter out guide with <20 cells
 
 ```{r}
-# Perfrom the same calculation using matrix
+# set expression matrix and define control cells
 expr_matrix <- GetAssayData(so, layer = "data") 
 meta_data <- so@meta.data
 
@@ -669,14 +629,13 @@ list_of_guides <- grep("^NTC", unique(so@meta.data$gRNA), value = TRUE, invert =
 
 for (guide in list_of_guides) {
 
-  target_gene <- unique(meta_data$target_gene_name[meta_data$gRNA == guide])
+    target_gene <- unique(meta_data$target_gene_name[meta_data$gRNA == guide])
 
     kd_cells <- rownames(meta_data)[meta_data$gRNA == guide]
     n_kd_cells <- length(kd_cells)
     
     # skip testing if less than 20 cells
     if (n_kd_cells < 20) {
-      # Print name of failing guide
       message(paste("\nSkipping:", guide, "- Too few cells ( Count =", n_kd_cells, ")"))
       if (!pb$finished) pb$tick()
       next
@@ -690,8 +649,8 @@ for (guide in list_of_guides) {
     mean_kd_v5 <- (sum(expm1(vec_kd_cells)) + 1) / length(vec_kd_cells)
     mean_ctrl_v5 <- (sum(expm1(vec_control)) + 1) / length(vec_control)
     manual_logfc_v5 <- log2(mean_kd_v5) - log2(mean_ctrl_v5)
-    
-    # F. Store Result
+
+    # Store the data
     guide_kd_result[[guide]] <- data.frame(
       guide_name = guide,
       target_gene = target_gene,
@@ -713,8 +672,111 @@ write_xlsx(gRNA_knockdown_summary_matrix, path = "iPSC_figures_fork/gRNA_knockdo
 
 ```
 
+## 8.2 Plot expression level of target gene of all guides compared to NTC
 
-## 8.2 Subset the Seurat object with only guide pass logFC filter
+```{r}
+
+list_of_target_genes <- unique(meta_data$target_gene_name)
+list_of_target_genes <- setdiff(list_of_target_genes, "Non-targeting")
+
+
+
+for (target_gene in list_of_target_genes){
+  
+  # Get control cell expression matrix and dataframe
+  vec_control <- expr_matrix[target_gene, control_cells]
+  
+  df_control <- data.frame(
+    Expression = vec_control,
+    Group = "Non-Targeting Control",
+    Type = "Control"
+  )
+  
+  guides_in_gene <- str_sort(unique(meta_data$gRNA[meta_data$target_gene_name == target_gene]), numeric = TRUE)
+  guide_data_list <- list()
+  guide_counts <- list()
+  
+  # Control cell count
+  control_count <- length(vec_control)
+  guide_counts[["Non-Targeting Control"]] <- control_count
+  
+  for (guide in guides_in_gene) {
+
+    kd_cells <- rownames(meta_data)[meta_data$gRNA == guide]
+    
+    if (length(kd_cells) > 20) {
+      vec_kd_cells <- expr_matrix[target_gene, kd_cells]
+      
+      # Create a temporary dataframe for this specific guide
+      df_temp <- data.frame(
+        Expression = vec_kd_cells,
+        Group = guide,
+        Type = "Guide"
+      )
+      
+      # Add to our list
+      guide_data_list[[guide]] <- df_temp
+      
+      # Add cell counts
+      guide_counts[[guide]] <- length(kd_cells)
+      
+      }
+    
+        
+  }
+  
+  # combine all guide information with target_gene
+  df_guides_all <- do.call(rbind, guide_data_list)
+  plot_data <- rbind(df_control, df_guides_all)
+  
+  ordered_groups <- c("Non-Targeting Control", names(guide_data_list))
+  plot_data$Group <- factor(plot_data$Group, levels = ordered_groups)
+  
+  # Create label data
+  label_data <- data.frame(
+    Group = ordered_groups,
+    N_Cells = unlist(guide_counts[ordered_groups])
+  )
+  
+  
+  max_y_value <- max(plot_data$Expression)
+  label_data$y_pos <- max_y_value * 1.1 # Position label 5% above the max data point
+
+  
+  # Plotting
+  p <- ggplot(plot_data, aes(x = Group, y = Expression, fill = Type)) +
+    geom_violin(scale = "width", trim = FALSE) +
+    geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+    geom_text(
+      data = label_data, 
+      aes(x = Group, y = y_pos, label = paste("N =", N_Cells)),
+      inherit.aes = FALSE, # Do not inherit fill = Type
+      size = 3,            # Adjust size as needed
+      vjust = 0            # Vertically align the text at the bottom of y_pos
+    ) +
+    scale_fill_manual(values = c("Control" = "grey", "Guide" = "lightblue")) +
+    labs(
+      title = paste("Target Gene Expression:", target_gene),
+      x = "gRNA ID",
+      y = "Expression Level"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none"
+    )
+
+  
+   ggsave(filename = paste0("iPSC_figures_fork/target_gene_expr/", target_gene, "_gRNA_Expression.png"), plot = p, width = 4000, height = 1500, dpi = 300, units = "px")
+
+}
+  
+  
+
+```
+
+
+## 8.3 Subset the Seurat object with only guide pass logFC filter
 
 ```{r}
 gRNA_knockdown_summary_matrix <- gRNA_knockdown_summary_matrix %>% 
@@ -750,10 +812,182 @@ ggsave(plot = tSNE, filename = "iPSC_figures_fork/tSNE_plot_by_gene_after_logFC_
 
 ```
 
+
+## 8.4 Using alternative method to calculate guide knockdown efficiency
+       MAST - this method is slower since it requires to calculate the entire transcriptomic profile not just the target gene
+       
+```{r}
+
+
+pb <- progress_bar$new(
+  format = "  Testing Guides [:bar] :percent | Elapsed: :elapsed | ETA: :eta",
+  total = length(list_of_guides),
+  clear = FALSE,
+  width = 100
+)
+
+for (guide in list_of_guides) {
+  target_gene <- unique(so@meta.data$target_gene_name[so@meta.data$gRNA == guide])
+  so_sub <- subset(so, subset = NT_gRNA == "non-targeting" | gRNA == guide)
+
+  n_cells <- sum(so_sub$gRNA == guide)
+  if (n_cells < 20) {
+      # Print the name of the failing guide
+      message(paste("\nSkipping:", guide, "- Too few cells ( Count =", n_cells, ")"))
+
+      # Tick progress bar so it doesn't get stuck
+      if (!pb$finished) pb$tick()
+      next # Skip to next iteration immediately
+  }
+  
+
+  so_sub$comparison_group <- ifelse(so_sub$gRNA == guide, "Knockdown", "Control")
+  Idents(so_sub) <- "comparison_group"
+  deg <- FindMarkers(so_sub,
+                       ident.1 = "Knockdown",
+                       ident.2 = "Control",
+                       features = c(target_gene, "GAPDH"), # only test the target gene with a dummy gene otherwise it won't pass at filter
+                       test.use = "MAST",
+                       logfc.threshold = 0,
+                       min.pct = 0.1,
+                       verbose = FALSE)
+  deg <- deg[target_gene, ]
+  deg$guide_name <- guide
+  deg$target_gene <- target_gene
+  deg$cell_count <- n_cells
+  guide_kd_result[[guide]] <- deg
+
+  if (!pb$finished) {
+    pb$tick()
+  }
+
+}
+
+gRNA_knockdown_summary_MAST <- do.call(rbind, guide_kd_result)
+write_xlsx(gRNA_knockdown_summary_MAST, path = "iPSC_figures_fork/gRNA_knockdown_summary_MAST.xlsx")
+
+gRNA_knockdown_summary_MAST <- gRNA_knockdown_summary_MAST %>% 
+  dplyr::filter(avg_log2FC < log2(0.7) & p_val < 0.05)
+
+# check guide left for each gene
+table(gRNA_knockdown_summary_MAST$target_gene)
+logFC_filter_guide_MAST <- gRNA_knockdown_summary_MAST$guide_name
+
+
+# Check whether MAST vs Wilcoxon text gives the same guide filter
+identical(logFC_filter_guide, logFC_filter_guide_MAST)
+```
+
+
 ```{r}
 # Saving the logFC-filtered seurat object
 qs_save(object = so_logFC_filter, file = paste0(getwd(), "/data/2_COMPASS-iPSC-gRNA-logFC-filtered.qs2"))
 ```
+
+
+# 9. Run basic Wilcoxon test on guides that passed the logFC filter
+     Pseudo-bulk all the guide together
+     
+```{r}
+# load Seurat object post-logFC filter
+so_logFC_filter <- qs_read(file = paste0(getwd(), "/data/2_COMPASS-iPSC-gRNA-logFC-filtered.qs2"))
+meta <- so@meta.data
+```
+```{r}
+
+list_of_genes <- unique (so_logFC_filter@meta.data$target_gene_name)
+list_of_genes <- setdiff(list_of_genes, "Non-targeting")
+list_of_degs <- list()
+
+
+
+for (gene in list_of_genes) {
+  
+  print(paste0("Performing DE Analysis on ", gene))
+ 
+   so_logFC_filter_sub <- subset(so_logFC_filter, subset = NT_gRNA == "non-targeting" | target_gene_name == gene)
+
+  so_logFC_filter_sub$comparison_group <- ifelse(so_logFC_filter$target_gene_name == gene, "Knockdown", "Control")
+  Idents(so_logFC_filter_sub) <- "comparison_group"
+  
+  deg <- FindMarkers(so_logFC_filter_sub,
+                         ident.1 = "Knockdown",
+                         ident.2 = "Control",
+                         logfc.threshold = 0,
+                         min.pct = 0.1, 
+                         verbose = FALSE)
+  
+  deg <- deg %>% rownames_to_column(var = "Gene")
+  
+  # Perform FDR adjustment, default Seurat one is Bonferroni, too strigent
+  deg$p_val_adj_fdr <- p.adjust(deg$p_val, method = "fdr")
+  
+  
+  deg_filter <- deg %>% dplyr::filter(p_val_adj_fdr<0.05 & abs(avg_log2FC) > log2(1.2))
+  up_deg <- nrow(deg_filter %>% dplyr::filter(avg_log2FC > 0) )
+  down_deg <- nrow(deg_filter %>% dplyr::filter(avg_log2FC < 0) )
+  total_deg <- nrow(deg_filter)
+  gene_name <- gene
+  
+  df_temp <- data.frame(
+    Target_Gene = gene, 
+    Total_DEG = total_deg, 
+    Up_DEG = up_deg, 
+    Down_DEG = down_deg, 
+    stringsAsFactors = FALSE
+  )
+
+  list_of_degs[[gene]] <- df_temp
+  
+}
+
+DEG_summary <- do.call(rbind, list_of_degs)
+
+write_xlsx(DEG_summary, path = "iPSC_figures_fork/DEG_logFC_Filter_Wilcoxon.xlsx")
+
+```
+```{r}
+
+gene <- "SETBP1"
+
+so_logFC_filter_sub <- subset(so_logFC_filter, subset = NT_gRNA == "non-targeting" | target_gene_name == gene)
+
+so_logFC_filter_sub$comparison_group <- ifelse(so_logFC_filter$target_gene_name == gene, "Knockdown", "Control")
+Idents(so_logFC_filter_sub) <- "comparison_group"
+  
+deg <- FindMarkers(so_logFC_filter_sub,
+                         ident.1 = "Knockdown",
+                         ident.2 = "Control",
+                   test.use = "MAST",
+                         logfc.threshold = 0.1,
+                         min.pct = 0.01, 
+                         verbose = FALSE)
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # 8. Mixscale per gRNA
