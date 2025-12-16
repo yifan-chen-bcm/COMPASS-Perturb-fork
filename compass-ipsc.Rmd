@@ -9,8 +9,6 @@ output: html_document
 # 12-13-2025
 ---
 
-
-
 # 0. Importing Libraries and Setting the File Path to 10X output
 
 ```{r setup, include=FALSE}
@@ -20,7 +18,6 @@ library(readxl)
 library(writexl)
 library(qs2)
 library(Seurat)
-#library(DoubletFinder)
 library(Mixscale)
 library(DropletUtils)
 library(SingleCellExperiment)
@@ -32,26 +29,22 @@ library(plyr)
 library(gtools)
 library(cowplot)
 library(patchwork)
-library(WGCNA)
-library(hdWGCNA)
+library(progress)
 
 # Setting the file path to the 10X files
-dir_10x <- "/home/rdhin/data/perturbed-compass-10x/COM-iN-none-aggr/"
+dir_10x <- "/home/rdhin/data/perturbed-compass-10x/COM-iP-none-aggr/"
 
-# Setting hdWGCNA threads
-enableWGCNAThreads(nThreads = 10)
+
+
 ```
-
-
-
 
 # 1. Importing 10X files
 
 ## 1.1 iPSCs
 
 ```{r}
-# Importing 10X output - 
-mats <- Read10X(data.dir = "/home/rdhin/data/perturbed-compass-10x/COM-iN-none-aggr/")
+# Importing 10X output (unzipped folder containing barcodes/features/matrix) - 
+mats <- Read10X(data.dir = paste0(dir_10x, "count/reads")) # loading file is much slower on RStudio Server due to IO speed limit
 print(names(mats))
 ```
 
@@ -64,27 +57,28 @@ DefaultAssay(so) <- "RNA"
 
 ```{r}
 # Optional export to seurat object - with NO processing
-#qs_save(object = so, file = paste0(dir_10x, "seurat_objects/0_iPSC_unprocessed.qs2"))
+qs_save(object = so, file = paste0(getwd(), "/data/0_COMPASS-iPSC-no-processing.qs2"))
 ```
 
 ```{r}
 # Reading in the processed seurat objects
-so <- qs_read(file = paste0(dir_10x, "seurat_objects/2_iPSC_Mixscale.qs2"))
+so <- qs_read(file = paste0(getwd(), "/data/0_COMPASS-iPSC-no-processing.qs2"))
 meta <- so@meta.data
 ```
-
-
-
 
 # 2. gRNA calls from CellRanger - Gaussian distribution
 
 ## 2.1 Plotting number of gRNAs per cell
 
 ```{r}
-grna.calls <- read.csv(file = "/mnt/mass_storage1/mass_storage_projects/compass/COM-iP-none-aggr/count/protospacer_calls_per_cell.csv", row.names = 1)
+# Unzip the crispr_analysis.tar.gz into crispr_reads folder
+grna.calls <- read.csv(file = paste0(dir_10x, "count/crispr_reads/protospacer_calls_per_cell.csv"), row.names = 1)
+
 ```
 
 ```{r}
+### gRNA per cell graphs
+
 # Histogram of gRNA calls
 num.grna.calls <- table(grna.calls$num_features) %>% as.data.frame()
 num.grna.calls$Var1 <- as.numeric(num.grna.calls$Var1)
@@ -115,7 +109,7 @@ num.grna.hist <- num.grna.calls %>% ggplot(aes(x = Var1, y = Freq)) +
 print(num.grna.hist)
 
 # Saving plot
-#ggsave(plot = num.grna.hist, filename = "iPSC_figures/guide_counts_histogram.png", width = 3000, height = 2000, units = "px", dpi = 300)
+ggsave(plot = num.grna.hist, filename = "iPSC_figures_fork/guide_counts_histogram.png", width = 3000, height = 2000, units = "px", dpi = 300)
 ```
 
 ## 2.2 Filtering for cells that got 1 gRNA and adding gRNA metadata
@@ -123,45 +117,38 @@ print(num.grna.hist)
 ```{r}
 # Filtering for cells that only got 1 gRNA and adding metadata for gRNAs
 grna.calls.filt <- grna.calls[grna.calls$num_features == 1, ]
-grna.calls.filt <- grna.calls.filt %>% dplyr::select(feature_call, num_umis)
-colnames(grna.calls.filt) <- c("original_gRNA", "num_UMIs_gRNA")
-grna.calls.filt <- rownames_to_column(grna.calls.filt, var = "cell_barcode")
+grna.calls.filt <- grna.calls.filt %>% dplyr::select(feature_call, num_umis) %>% rownames_to_column(var = "sequence") 
 
-# Cleaning up the names of ugly-formatted gRNAs
-map_df <- data.frame(original_gRNA = sort(names(table(grna.calls.filt$original_gRNA)))) %>% 
-  dplyr::mutate(
-    gene = str_extract(original_gRNA, "^[^_]+")
-  ) %>% 
-  dplyr::group_by(gene) %>% 
-  dplyr::mutate(
-    replicate = dplyr::row_number(),
-    gRNA = paste0(gene, "-", replicate)
-  ) %>% 
-  dplyr::ungroup()
+# Inport the inital manifest of gRNA names
+grna.names <- read.csv(file = paste0(dir_10x, "count/crispr_reads/feature_reference.csv")) %>%  dplyr::select("id", "name", "target_gene_name")
+
+# Replace the name of gRNA with manifest
+grna.calls.rename <- left_join(grna.calls.filt, grna.names, by = c("feature_call" = "id"))
+grna.calls.rename <- grna.calls.rename %>% 
+  select(sequence, num_umis, gRNA = name, target_gene_name)
+
+!any(is.na(grna.calls.rename$gRNA)) # check if all guide has a name, pass if return "TRUE"
 
 # Merging with gene & cleaned gRNA information
-grna.calls.filt <- merge(x = grna.calls.filt, y = map_df, on = "original_gRNA")
-grna.calls.filt <- column_to_rownames(grna.calls.filt, var = "cell_barcode")
+grna.calls.rename <- column_to_rownames(grna.calls.rename, var = "sequence")
 
 # Making a column for non-targeting controls
-grna.calls.filt$NT_gRNA <- ifelse(test = grepl("non-targeting", grna.calls.filt$gRNA), yes = "non-targeting", no = grna.calls.filt$gRNA)
+grna.calls.rename$NT_gRNA <- ifelse(test = grepl("NTC", grna.calls.rename$gRNA), yes = "non-targeting", no = grna.calls.rename$gRNA)
 ```
 
 ```{r}
 # Subsetting the seurat object for cells with 1 gRNA
-so <- subset(so, cells = rownames(grna.calls.filt))
+so <- subset(so, cells = rownames(grna.calls.rename))
 
 # Adding mitochondrial counts metadata
 so[["percent.mt"]] <- PercentageFeatureSet(so, pattern = "^MT-")
 
 # Adding metadata for gRNAs to the seurat object
-so <- AddMetaData(so, metadata = grna.calls.filt)
+so <- AddMetaData(so, metadata = grna.calls.rename)
 
 # Extracting the metadata
 meta <- so@meta.data
 ```
-
-
 
 # 3. QC metrics
 
@@ -176,24 +163,32 @@ p1 <- VlnPlot(object = so,
               pt.size = 0, 
               cols = c("#037bfc", "#037bfc", "#037bfc")) +
   NoLegend() +
-  geom_hline(yintercept = c(p1_qlow, p1_qhigh), linetype = "dashed", color = "red")
+  geom_hline(yintercept = c(p1_qlow, p1_qhigh), linetype = "dashed", color = "red") +
+  theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank())+
+  xlab(NULL)
 
 # nCounts
 p2 <- VlnPlot(object = so, 
               features = c("nCount_RNA"),
               pt.size = 0, 
               cols = c("#037bfc", "#037bfc", "#037bfc")) +
-  NoLegend() 
+  NoLegend()+
+    theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank())+
+  xlab(NULL)
 
 # percent mitochondrial RNA
-p3_qlow <- quantile(x = so$percent.mt, 0.05)
-p3_qhigh <- quantile(x = so$percent.mt, 0.95)
 p3 <- VlnPlot(object = so, 
               features = c("percent.mt"),
               pt.size = 0, 
               cols = c("#037bfc", "#037bfc", "#037bfc")) +
   NoLegend() +
-  geom_hline(yintercept = c(p3_qlow, p3_qhigh), linetype = "dashed", color = "red")
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red")+
+  theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank())+
+  xlab(NULL)
+
 
 # 3 plots
 qc_filtering_plot <- p1 | p2 | p3
@@ -204,29 +199,36 @@ qc_filtering_plot <- p1 | p3
 print(qc_filtering_plot)
 
 # Saving the plot
-#ggsave(plot = qc_filtering_plot, filename = "iPSC_figures/QC_metrics_after_filtering.png", width = 2200, height = 1500, units = "px", dpi = 300)
+ggsave(plot = qc_filtering_plot, filename = "iPSC_figures_fork/QC_metrics_after_filtering.png", width = 2200, height = 1500, units = "px", dpi = 300)
 ```
 
 ## 3.2 FeatureScatter QC plots
 
 ```{r}
 # FeatureScatter is typically used to visualize feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
-plot1 <- FeatureScatter(so, feature1 = "nFeature_RNA", feature2 = "percent.mt")
-plot2 <- FeatureScatter(so, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 <- FeatureScatter(so, feature1 = "nFeature_RNA", feature2 = "percent.mt") +NoLegend()
+plot2 <- FeatureScatter(so, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +NoLegend()
 qc_scatter <- plot1 + plot2
 print(qc_scatter)
 
 # Saving the plot
-#ggsave(plot = qc_scatter, filename = "iPSC_figures/qc_scatter_after_filtering.png", width = 3500, height = 1500, units = "px", dpi = 300)
+ggsave(plot = qc_scatter, filename = "iPSC_figures_fork/qc_scatter_after_filtering.png", width = 3500, height = 1500, units = "px", dpi = 300)
 ```
 
 ## 3.3 Filtering on QC metrics
 
 ```{r}
-so <- subset(so, subset = nFeature_RNA > p1_qlow & nFeature_RNA < p1_qhigh & percent.mt > p3_qlow & percent.mt < p3_qhigh)
+#### Apply filter matrix here - using 5% percentage mt as cutoff
+n_before <- ncol(so)
+so <- subset(so, subset = nFeature_RNA > p1_qlow & nFeature_RNA < p1_qhigh & percent.mt < 10)
+
+# Count cells after
+n_after <- ncol(so)
+# Calculate percentage lost
+percent_lost <- round((n_before - n_after) / n_before * 100, 2)
+
+print(paste("You are removing", percent_lost, "% of your cells."))
 ```
-
-
 
 # 4. Normalizing, Finding Variable Features, and Scaling
 
@@ -243,8 +245,6 @@ so <- ScaleData(so, features = all.genes)
 gc()
 ```
 
-
-
 # 5. PCA and UMAP
 
 ## 5.1 PCA
@@ -252,7 +252,6 @@ gc()
 ```{r}
 # PCA
 so <- RunPCA(so)
-gc()
 ```
 
 ```{r}
@@ -263,7 +262,7 @@ print(elbow)
 #DimHeatmap(so, dims = 1:15, cells = 500, balanced = TRUE)
 
 # Saving the plot 
-#ggsave(plot = elbow, filename = "iPSC_figures/PCA_elbow_plot.png", height = 2000, width = 3000, units = "px", dpi = 300)
+ggsave(plot = elbow, filename = "iPSC_figures_fork/PCA_elbow_plot.png", height = 2000, width = 3000, units = "px", dpi = 300)
 ```
 
 ```{r}
@@ -279,33 +278,49 @@ print(pca.plot)
 
 ```{r}
 # Clustering the cells with UMAP
-so <- FindNeighbors(so, dims = 1:40)  #5 PCs from elbowplot
-gc()
+so <- FindNeighbors(so, dims = 1:15)  #15 PCs from elbowplot
 so <- FindClusters(so, resolution = 1, algorithm = 4, verbose = FALSE)  #resolution optimal from 0.4-1.2. algorithm = Leiden (4), 1 = Louvain
-gc()
 head(Idents(so), 5)  #clusters can be found using the Idents() function
 
 # UMAP
-so <- RunUMAP(so, dims = 1:40)
-gc()
+so <- RunUMAP(so, dims = 1:15)
+
 ```
 
 ```{r}
 # Plotting a UMAP Plot
-UMAP_plot <- DimPlot(so, reduction = "umap", group.by = "gene")
-UMAP_plot <- FeaturePlot(so, reduction = "umap", features = c("NEUROG2", "RBFOX3", "MAP2", "POU5F1", "SOX2", "KLF4"), ncol = 3)
-#UMAP_plot <- DimPlot(so, reduction = "umap", group.by = "gRNA")
-print(UMAP_plot)
+UMAP_plot <- FeaturePlot(so, 
+                         reduction = "umap", 
+                         features = c("NEUROG2", "RBFOX3", "MAP2", "POU5F1", "SOX2", "NANOG"), 
+                         ncol = 3,
+                         order = TRUE)
 
+
+print(UMAP_plot)
+ggsave(plot = UMAP_plot, filename = "iPSC_figures_fork/UMAP_plot_neuro-markers.png", width = 3000, height = 2000, dpi = 300, units = "px")
+
+UMAP_by_gene <- DimPlot(so, reduction = "umap", group.by = "target_gene_name")
 # Saving the plot
-#ggsave(plot = UMAP_plot, filename = "iPSC_figures/UMAP_plot_neuro-markers.png", width = 3000, height = 2000, dpi = 300, units = "px")
+ggsave(plot = UMAP_by_gene, filename = "iPSC_figures_fork/UMAP_plot_by_gene.png", width = 3000, height = 2000, dpi = 300, units = "px")
 ```
+
+
+
+## 5.3 ICA Reduction and tSNE plot
+
+```{r}
+so <- RunICA(so, features = VariableFeatures(so), nics = 50)
+so <- RunTSNE(so, reduction = "ica", dims = 1:30)
+tSNE <- DimPlot(so, reduction = "tsne", group.by = "target_gene_name") + ggtitle("t-SNE (Computed on ICA)")
+ggsave(plot = tSNE, filename = "iPSC_figures_fork/tSNE_plot_by_gene.png", width = 3000, height = 2000, dpi = 300, units = "px")
+
+```
+
 
 ```{r}
 # Saving the processed seurat object
-#qs_save(object = so, file = paste0(dir_10x, "seurat_objects/1_iPSC_processed.qs2"))
+qs_save(object = so, file = paste0(getwd(), "/data/1_COMPASS-iPSC-gRNA-QC.qs2"))
 ```
-
 
 
 # 6. Number of cells per gRNA to plot synthetic lethality
@@ -352,16 +367,131 @@ indiv_gRNA_plot <- indiv_gRNA_counts2 %>% ggplot(aes(x = reorder(gene, mean_cell
 print(indiv_gRNA_plot)
 
 # Saving the plot
-#ggsave(plot = indiv_gRNA_plot, filename = "iPSC_figures/gRNA_assignment_counts.png", width = 2000, height = 1500, dpi = 300, units = "px")
+ggsave(plot = indiv_gRNA_plot, filename = "iPSC_figures_fork/gRNA_assignment_counts.png", width = 2000, height = 1500, dpi = 300, units = "px")
 ```
 
-
-
-# 7. Downsampling cells to control for power
+# 7. DEG between each guide and NTC to drop off guide that doesn't perturb target gene expression by 30%
 
 ```{r}
+list_of_guides <- grep("^NTC", unique(so@meta.data$gRNA), value = TRUE, invert = TRUE)
+guide_kd_result <- list()
+
+pb <- progress_bar$new(
+  format = "  Testing Guides [:bar] :percent | Elapsed: :elapsed | ETA: :eta",
+  total = length(list_of_guides),
+  clear = FALSE,
+  width = 100
+)
+
+for (guide in list_of_guides) {
+  target_gene <- unique(so@meta.data$target_gene_name[so@meta.data$gRNA == guide])
+  so_sub <- subset(so, subset = NT_gRNA == "non-targeting" | gRNA == guide)
+  
+  n_cells <- sum(so_sub$gRNA == guide)
+  if (n_cells < 4) {
+      # Print the name of the failing guide
+      message(paste("\nSkipping:", guide, "- Too few cells ( Count =", n_cells, ")"))
+      
+      # Tick progress bar so it doesn't get stuck
+      if (!pb$finished) pb$tick()
+      next # Skip to next iteration immediately
+  }
+  
+  so_sub$comparison_group <- ifelse(so_sub$gRNA == guide, "Knockdown", "Control")
+  Idents(so_sub) <- "comparison_group"
+  deg <- FindMarkers(so_sub, 
+                       ident.1 = "Knockdown", 
+                       ident.2 = "Control", 
+                       features = target_gene, # only test the target gene
+                       test.use = "MAST", 
+                       logfc.threshold = 0,
+                       min.pct = 0,
+                       verbose = FALSE)
+  
+  deg$guide_name <- guide
+  deg$target_gene <- target_gene
+  deg$cell_count <- n_cells
+  guide_kd_result[[guide]] <- deg
+  
+  if (!pb$finished) {
+    pb$tick()
+  }
+  
+}
+
+gRNA_knockdown_summary <- do.call(rbind, guide_kd_result)
+
+# save the table
+write_xlsx(gRNA_knockdown_summary, path = "iPSC_figures_fork/gRNA_knockdown_summary.xlsx")
+```
+
+
+```{r}
+# Perfrom the same calculation using matrix
+expr_matrix <- GetAssayData(so, layer = "data") 
+meta_data <- so@meta.data
+
+control_cells <- rownames(meta_data)[meta_data$NT_gRNA == "non-targeting"]
+n_control <- length(control_cells)
+
+# Setup ETA Progress Bar
+pb <- progress_bar$new(
+  format = "  Running [:bar] :percent | ETA: :eta",
+  total = length(list_of_guides),
+  clear = FALSE,
+  width = 60
+)
+
+# Initialize storage
+guide_kd_result <- list()
+list_of_guides <- grep("^NTC", unique(so@meta.data$gRNA), value = TRUE, invert = TRUE)
+
+
+for (guide in list_of_guides) {
+
+  target_gene <- unique(meta_data$target_gene_name[meta_data$gRNA == guide])
+
+    kd_cells <- rownames(meta_data)[meta_data$gRNA == guide]
+    n_kd_cells <- length(kd_cells)
+    
+    # skip testing if less than 20 cells
+    if (n_kd_cells < 20) {
+      # Print name of failing guide
+      message(paste("\nSkipping:", guide, "- Too few cells ( Count =", n_kd_cells, ")"))
+      if (!pb$finished) pb$tick()
+      next
+    }
+        
+    vec_kd_cells <- expr_matrix[target_gene, kd_cells]
+    vec_control <- expr_matrix[target_gene, control_cells]
+        
+    p_val <- suppressWarnings(wilcox.test(vec_kd_cells, vec_control)$p.value)
+  
+    mean_kd_v5 <- (sum(expm1(vec_kd_cells)) + 1) / length(vec_kd_cells)
+    mean_ctrl_v5 <- (sum(expm1(vec_control)) + 1) / length(vec_control)
+    manual_logfc_v5 <- log2(mean_kd_v5) - log2(mean_ctrl_v5)
+    
+    # F. Store Result
+    guide_kd_result[[guide]] <- data.frame(
+      guide_name = guide,
+      target_gene = target_gene,
+      cell_count = n_kd_cells, # Store the count
+      p_val = p_val,
+      avg_log2FC = manual_logfc_v5
+    )
+
+  
+  # Update Progress Bar
+  if (!pb$finished) pb$tick()
+}
+
+
+gRNA_knockdown_summary_matrix <- do.call(rbind, guide_kd_result)
+
+
 
 ```
+
 
 
 
@@ -371,8 +501,6 @@ print(indiv_gRNA_plot)
 # The standardized mixscale scores will be saved in the metadata under the column "mixscale_score". 
 # Note: if multiple biological context (ex: cell lines) exists, we can use the "split.by" argument to specify the corresponding metadata column
 ```
-
-
 
 ```{r}
 # perturbation scores per gRNA
@@ -428,8 +556,6 @@ VlnPlot(so_temp, features = "TRRAP", group.by = "NT_gRNA", alpha = 0) +
   geom_boxplot(width = 0.5) + 
   geom_jitter(width = 0.1, alpha = 0.3, size = 0.5)
 ```
-
-
 
 # 9. Differential Expression Analysis per gRNA
 
@@ -492,8 +618,6 @@ degs_filt <- degs_filt[, c("gRNA", "gene_ID", "target_gene", "guide_replicate", 
 #write_xlsx(x = degs_filt, path = "iPSC_gRNA_DEGs/iPSC_gRNA_DEGs_counts.xlsx")
 ```
 
-
-
 ```{r}
 # Log2FC matrix for heatmap
 degs_heat <- degs_filt %>% tidyr::pivot_wider(id_cols = target_gene, names_from = guide_replicate, values_from = log2FC)
@@ -540,9 +664,7 @@ pheatmap(degs_heat,
 #dev.off()
 ```
 
-
-
-# 10. Spearman correlation for each gRNA / gene to find off-target effects 
+# 10. Spearman correlation for each gRNA / gene to find off-target effects
 
 ```{r}
 # Getting pseudo-bulk expression profiles per gRNA
@@ -583,8 +705,6 @@ pheatmap(cor_mat,
 )
 #dev.off()
 ```
-
-
 
 # 11. Mixscale per gene after filtering out gRNAs that did not work
 
@@ -652,9 +772,6 @@ print(mixed_scatter)
 #ggsave(plot = mixed_scatter, filename = "iPSC_figures/gene_mixscale_scatter.png", width = 2000, height = 2000, dpi = 300, units = "px")
 ```
 
-
-
-
 # 12. hdWGCNA
 
 ```{r}
@@ -700,28 +817,3 @@ metacell_umap
 # Saving the plot
 #ggsave(plot = metacell_umap, filename = "iPSC_figures/metacell_umap.png", width = 1700, height = 1500, dpi = 300, units = "px")
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

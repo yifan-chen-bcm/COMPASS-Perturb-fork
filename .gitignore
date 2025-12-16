@@ -1,6 +1,6 @@
 # Folders to ignore
 .Rproj.user
-
+data
 # Files to ignore
 .RData
 .Rhistory
