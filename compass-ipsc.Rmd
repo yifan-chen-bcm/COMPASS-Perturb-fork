@@ -31,6 +31,9 @@ library(gtools)
 library(cowplot)
 library(patchwork)
 library(progress)
+library(kSamples)
+library(utils)
+library(future.apply)
 
 # Setting the file path to the 10X files
 dir_10x <- "/home/rdhin/data/perturbed-compass-10x/COM-iP-none-aggr/"
@@ -471,7 +474,7 @@ ntc_spearman_cor <- pheatmap(
   main = "Spearman Correlation of NT Guides",
   display_numbers = TRUE,
   color = colorRampPalette(c("blue", "white", "red"))(100),
-  breaks = seq(0.8, 1, length.out = 101),
+  breaks = seq(0.85, 1, length.out = 101),
   cluster_rows = FALSE, 
   cluster_cols = FALSE
 )
@@ -481,100 +484,191 @@ ggsave(filename = "iPSC_figures_fork/NTC_Spearman_Correlation.png", plot = ntc_s
 ```
 
 ## 7.1 Perfrom DEG of one NT guide against the rest of NT guides
+       Here I am using Replogle et al. method to perfrom NTC similiar testing
+       
+     # 1) Subset to only contain genes with mean UMI > 1
+     # 2) z-normalized the expression
+     # 3) Perform Anderson-Darling test between all possible pairs of NTC
 
 ```{r}
 
-# Create a container to store results
-deg_counts <- data.frame(
-  Comparison = character(),
-  Total = numeric(),
-  Genes = character(),
-  stringsAsFactors = FALSE
-)
+# Subset to only contain mean gene UMI > 1
+raw_counts <- GetAssayData(so_ntc, assay = "RNA", layer = "counts")
+gene_means <- rowMeans(raw_counts)
 
+# Filter for genes with mean > 1 UMI count per cell
+high_umi_genes <- names(gene_means[gene_means > 1])
+so_ntc_filtered <- subset(so_ntc, features = high_umi_genes)
+
+# z-normalized the expression
+so_ntc_filtered <- ScaleData(so_ntc_filtered, features = high_umi_genes)
+z_data <- GetAssayData(so_ntc_filtered, layer = "scale.data")
+
+# Identify all NTC guides
+ntc_guides <- unique(so_ntc_filtered$gRNA) # adjust metadata column name as needed
+pairs <- combn(ntc_guides, 2) # Get all possible pairs
+
+# Set Parallel processing 
+plan(multisession, workers = 8)
+options(future.globals.maxSize = 8000 * 1024^2)
+
+pairs_list <- split(pairs, col(pairs))
+
+
+# Perform Anderson-Darling test
+system.time({
+  ad_results_list <- future_lapply(pairs_list, function(p) {
+    g1 <- p[1]
+    g2 <- p[2]
+    
+    # Pre-extract data for these two guides to avoid subsetting 2000 times
+    cells_g1 <- which(so_ntc_filtered$gRNA == g1)
+    cells_g2 <- which(so_ntc_filtered$gRNA == g2)
+    
+    data_g1 <- z_data[, cells_g1, drop = FALSE]
+    data_g2 <- z_data[, cells_g2, drop = FALSE]
+    
+    # Run tests for all genes in this pair
+    gene_results <- lapply(high_umi_genes, function(gene) {
+      res <- ad.test(data_g1[gene, ], data_g2[gene, ])
+      return(data.frame(
+        Gene = gene,
+        Pair = paste(g1, g2, sep = "_vs_"),
+        p_val = res$ad[1, 3]
+      ))
+    })
+    
+    return(do.call(rbind, gene_results))
+  }, future.seed = TRUE)
+})
+
+
+ad_results <- do.call(rbind, ad_results_list)
+
+ad_results$p_val_adj <- p.adjust(ad_results$p_val, method = "BH")
+
+sig_hits <- ad_results %>% 
+  dplyr::filter(p_val_adj < 0.05)
+
+```
+
+## 7.2 Perform Wilcox test between one NTC and the rest of NTCs
+
+```{r}
+# empty list to store all results
+ntc_rest_deg_list <- list()
 
 for (id in ntc_guides) {
   message(paste("Processing:", id, "vs remaining NTCs..."))
   
+  cells_1 <- WhichCells(so_ntc, idents = id)
+  n_cells <- length(cells_1)
+  
   rest_of_ntcs <- setdiff(ntc_guides, id)
+  cells_2_pool <- WhichCells(so_ntc, idents = rest_of_ntcs)
+
+  # Perform downsampling on the rest of NTCs cells to be 1.5x of the specific guide cell counts
+  cells_2_downsampled <- sample(cells_2_pool, size = 1.5*n_cells)
   
   try({
     markers <- FindMarkers(
       so_ntc,
-      ident.1 = id,
-      ident.2 = rest_of_ntcs,
-      min.pct = 0.1,
+      ident.1 = cells_1,
+      ident.2 = cells_2_downsampled,
       logfc.threshold = 0,
       test.use = "wilcox",
       verbose = FALSE
     )
     
-    markers$p_val_adj_fdr <- p.adjust(markers$p_val, method = "fdr")
-
-    sig_markers <- markers %>% 
-      dplyr::filter(p_val_adj_fdr < 0.05)
-
-    num_degs <- nrow(sig_markers)
-    gene_list_str <- paste(rownames(sig_markers), collapse = ", ")
-
-    deg_counts <- rbind(deg_counts, data.frame(
-      Comparison = id,
-      Total = num_degs,
-      Genes = gene_list_str
-    ))
+    # Store the comparison ID and the gene name within the table
+    markers$Comparison <- id
+    markers$Gene <- rownames(markers)
     
+    ntc_rest_deg_list[[id]] <- markers
   }, silent = TRUE)
 }
+
+ntc_rest_deg <- do.call(rbind, ntc_rest_deg_list)
+
+# Perform Study-wise FDR correction
+ntc_rest_deg$study_wide_fdr <- p.adjust(ntc_rest_deg$p_val, method = "fdr")
+
+deg_counts <- ntc_rest_deg %>%
+  dplyr::filter(study_wide_fdr < 0.05) %>%  # apply a log fold change cutoff of 20%
+  dplyr::group_by(Comparison) %>%
+  dplyr::summarise(
+    Total = n()
+  )
 
 print(deg_counts)
 
 ```
 
 
-## 7.2 Perform pair-wise DEG among all pairs of guides
+## 7.3 Perform pair-wise DEG among all pairs of guides
 
 ```{r}
-
+# Set up the comparison matrix
 deg_matrix <- matrix(0, nrow = length(ntc_guides), ncol = length(ntc_guides))
 rownames(deg_matrix) <- ntc_guides
 colnames(deg_matrix) <- ntc_guides
 
-for (i in ntc_guides) {
-  for (j in ntc_guides) {
-    
-    if (i == j) {
-      deg_matrix[i, j] <- 0
-      next
-    }
-    
+ntc_pairs <- combn(ntc_guides, 2)
 
-    message(paste("Comparing:", i, "vs", j))
+results_list <- list()
     
-    # Run FindMarkers with error handling
-    try({
-      markers <- FindMarkers(
-        so_ntc,
-        ident.1 = i,
-        ident.2 = j,
-        min.pct = 0.1,
-        logfc.threshold = 0,
-        test.use = "wilcox",
-        verbose = FALSE
-      )
-      markers$p_val_adj_fdr <- p.adjust(markers$p_val, method = "fdr")
+for (k in 1:ncol(ntc_pairs)) {
+  i <- ntc_pairs[1, k]
+  j <- ntc_pairs[2, k]
+  
+  message(paste("Comparing:", i, "vs", j))
+  
+  # Wrap in tryCatch to handle cases where a comparison might fail
+  res <- tryCatch({
+    markers <- FindMarkers(
+      so_ntc,
+      ident.1 = i,
+      ident.2 = j,
+      logfc.threshold = 0,
+      test.use = "wilcox",
+      verbose = FALSE
+    )
+    
+    # Add metadata so you know which comparison these p-values belong to
+    markers$comparison <- paste0(i, "_vs_", j)
+    markers$gene <- rownames(markers)
+    markers
+    
+  }, error = function(e) {
+    message(paste("Error in comparison", i, "vs", j, ":", e$message))
+    return(NULL)
+  })
+  
+  results_list[[k]] <- res
+}
 
-      sig_markers <- markers %>% 
-        dplyr::filter(p_val_adj_fdr < 0.05)%>% 
-        dplyr::filter(pct.1 > 0.1 | pct.2 > 0.1)
-      
-      n_sig <- nrow(sig_markers)
-      deg_matrix[i, j] <- n_sig
-      
-    }, silent = TRUE)
-  }
+# Perform study-wise FDR correction
+ntc_pairwise_deg <- do.call(rbind, results_list)
+ntc_pairwise_deg$fdr_study_wide <- p.adjust(ntc_pairwise_deg$p_val, method = "fdr")
+
+
+# fill matrix with significant gene counts
+for (k in 1:ncol(ntc_pairs)) {
+  i <- ntc_pairs[1, k]
+  j <- ntc_pairs[2, k]
+  
+  # Filter global results for this specific pair and significance
+  sig_genes_count <- sum(ntc_pairwise_deg$comparison == paste(i, j, sep = "_vs_") & 
+                         ntc_pairwise_deg$fdr_study_wide < 0.05)
+  
+  # Fill the matrix (symmetric)
+  deg_matrix[i, j] <- sig_genes_count
+  deg_matrix[j, i] <- sig_genes_count
 }
 
 # plot the matrix
+max_degs <- max(deg_matrix, na.rm = TRUE)
+
 heat_map <- pheatmap(
   deg_matrix,
   cluster_rows = FALSE,
@@ -588,17 +682,32 @@ heat_map <- pheatmap(
 ggsave(filename = "iPSC_figures_fork/NTC_DEG_heatmap.png", plot = heat_map, width = 2000, height = 1500, dpi = 300, units = "px")
 
 
-# check the gene of interest
-rest_of_ntcs <- setdiff(list_of_NT_gRNA, "NTC-g9")
-markers <- FindMarkers(
-        so_ntc,
-        ident.1 = "NTC-g9",
-        ident.2 = rest_of_ntcs,
-        min.pct = 0.1,
-        logfc.threshold = 0.25,
-        test.use = "wilcox",
-        verbose = FALSE)
+## check the gene of interest
+# rest_of_ntcs <- setdiff(list_of_NT_gRNA, "NTC-g8")
+# markers <- FindMarkers(
+#         so_ntc,
+#         ident.1 = "NTC-g8",
+#         ident.2 = rest_of_ntcs,
+#         min.pct = 0.1,
+#         logfc.threshold = 0.25,
+#         test.use = "wilcox",
+#         verbose = FALSE)
 ```
+
+## 7.4 PCA analysis of all NTC guides
+
+```{r}
+plan("sequential")
+so_ntc <- FindVariableFeatures(so_ntc, selection.method = "vst", nfeatures = 2000)
+so_ntc <- ScaleData(so_ntc)
+so_ntc <- RunPCA(so_ntc, features = VariableFeatures(object = so_ntc))
+
+DimPlot(so_ntc, reduction = "pca", group.by = "gRNA") + 
+  ggtitle("PCA of NTC Cells: Grouped by Guide")
+
+```
+
+
 
 
 
