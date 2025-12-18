@@ -1,6 +1,7 @@
 # Folders to ignore
 .Rproj.user
 data
+mixscale_training
 # Files to ignore
 .RData
 .Rhistory

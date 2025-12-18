@@ -6,13 +6,14 @@ output: html_document
 
 ### Forked Repo
 # Edit by Yifan Chen
-# 12-13-2025
+# 12-17-2025
 ---
 
 # 0. Importing Libraries and Setting the File Path to 10X output
 
 ```{r setup, include=FALSE}
 # Importing libraries  
+options(Seurat.object.assay.version = 'v3') 
 library(tidyverse)
 library(readxl)
 library(writexl)
@@ -999,16 +1000,17 @@ deg <- FindMarkers(so_logFC_filter_sub,
 
 ```{r}
 # perturbation scores per gRNA
+meta.data <- so@meta.data
 so <- CalcPerturbSig(
   object = so,
   assay = "RNA",
   slot = "data",
-  gd.class = "NT_gRNA",  #gRNA
-  nt.cell.class = "NonTargeting",
+  gd.class = "target_gene_name",  #gRNA
+  nt.cell.class = "Non-targeting",
   reduction = "pca",
-  ndims = 5,
+  ndims = 15,
   num.neighbors = 20,
-  new.assay.name = "Perturb_by_gRNA",  #perturb scores by gRNA
+  new.assay.name = "PRTB",  #perturb scores by gRNA
   split.by = NULL  #to specify the metadata column if multiple biological context (like cell lines exist)
 )
 ```
