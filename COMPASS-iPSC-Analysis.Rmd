@@ -1,0 +1,102 @@
+---
+title: "COMPASS-iPSC-Analysis"
+author: "Yifan Chen"
+date: "2025-12-18"
+output: html_documentgunz
+---
+
+```{r setup, include=FALSE}
+
+# Load all library
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(qs2)
+library(Seurat)
+library(Mixscale)
+library(DropletUtils)
+library(SingleCellExperiment)
+library(gprofiler2)
+library(presto)
+library(pheatmap)
+library(rstatix)
+library(plyr)
+library(gtools)
+library(cowplot)
+library(patchwork)
+library(progress)
+library(utils)
+library(Matrix)
+
+# 10X Cell Ranger Output location
+dir_10x <- "C:/Users/rdhin/Yifan/COMPASS-Perturb-fork/data/COM-iP-none-aggr"
+
+```
+
+# 1. Unzip the 10x Cell Ranger Output
+
+```{r}
+# Unzip crispr_analysis tar file
+crispr_tar_file <- file.path(dir_10x, "count/crispr_analysis.tar.gz")
+crispr_out_dir <- file.path(dir_10x, "count/CRISPR_count")
+
+if (!dir.exists(crispr_out_dir)) dir.create(crispr_out_dir, recursive = TRUE)
+
+wsl_cmd <- sprintf(
+  "wsl tar -zxvf $(wslpath '%s') -C $(wslpath '%s')",
+  crispr_tar_file, 
+  crispr_out_dir
+)
+
+# Unzip filtered_feature_bc_matrix tar file
+matrix_tar_file <- file.path(dir_10x, "count/filtered_feature_bc_matrix.tar.gz")
+matrix_out_dir <- file.path(dir_10x, "count/10x_matrix_count")
+
+if (!dir.exists(matrix_out_dir)) dir.create(matrix_out_dir, recursive = TRUE)
+
+wsl_cmd <- sprintf(
+  "wsl tar -zxvf $(wslpath '%s') -C $(wslpath '%s')",
+  matrix_tar_file, 
+  matrix_out_dir
+)
+
+rm(matrix_tar_file)
+rm(crispr_tar_file)
+rm(matrix_out_dir)
+
+system(wsl_cmd)
+```
+
+# 2. Run CLEANSER to filter ambient gRNA
+     https://www.cell.com/cell-genomics/fulltext/S2666-979X(25)00022-9 / https://github.com/Gersbachlab-Bioinformatics/CLEANSER
+
+```{r}
+mtx <- readMM(paste0(dir_10x ,"/count/10x_matrix_count/matrix.mtx.gz"))
+dim(mtx)
+
+features <- read.table(paste0(dir_10x ,"/count/10x_matrix_count/features.tsv.gz"), header = FALSE, sep = "\t")
+dim(features)
+barcode <- read.table(paste0(dir_10x ,"/count/10x_matrix_count/barcodes.tsv.gz"), header = FALSE, sep = "\t")
+dim(barcode)
+
+
+mtx1 <- readMM(paste0(dir_10x ,"/count/10x_matrix_count/input.mtx"))
+dim(mtx1)
+```
+
+
+- Run this code in Windows WSL inside $matrix_out_dir directory to convert 10x cell ranger output into clean matrix for CLEANSER
+
+$     cr2cleanser -m matrix.mtx.gz -f features.tsv.gz -o cleanser_input.mtx
+
+
+- Run CLEANSER
+
+$     cleanser -i cleanser_input.mtx -o cleanser_probabilities.csv --dc
+
+- Run CLEANSER Quality Control
+
+$     mkdir -p cleanser_qc
+$     cleanser_qc -i cleanser_probabilities.csv -o ./cleanser_qc
+
+
