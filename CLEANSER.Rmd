@@ -1,0 +1,207 @@
+---
+title: "CLEANSER"
+author: "Daniel Brock"
+date: "2025-12-22"
+output: html_document
+---
+
+# 0. Importing libraries
+
+```{r setup, include=FALSE}
+# Importing libraries
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(qs2)
+library(Seurat)
+library(pheatmap)
+library(ComplexHeatmap)
+library(gtools)
+library(patchwork)
+library(ggVennDiagram)
+library(scales)
+```
+
+
+
+# 1. Importing 10X output and seurat object
+
+```{r}
+# Importing 10X output - 
+mats <- Read10X(data.dir = "/mnt/mass_storage1/mass_storage_projects/compass/COM-iN-none-aggr/count/batch1/")
+print(names(mats))
+```
+
+```{r}
+# Building the seurat object with gene expression and CRISPR guide capture as a secondary assay
+so <- CreateSeuratObject(counts = mats[["Gene Expression"]], assay = "RNA")
+so[["CRISPR"]] <- CreateAssayObject(counts = mats[["CRISPR Guide Capture"]])
+DefaultAssay(so) <- "RNA"
+```
+
+
+
+# 2. Analyzing CLEANSER posterior outputs
+
+## 2.1 CLEANSER posterior probability >= 5
+
+```{r}
+# Cleanser for filtering out ambient gRNAs
+cleanser_posterior <- read.csv("CLEANSER/posteriors-output.csv", sep = "\t", header = F, skip = 1)
+colnames(cleanser_posterior) <- c("gRNA", "cell", "posterior_probability")
+#cleanser_output <- read.csv("CLEANSER/sample-output.csv", sep = "\t")
+
+# Features for getting gRNA info
+features_tsv <- read_tsv(file ="/mnt/mass_storage1/mass_storage_projects/compass/COM-iN-none-aggr/count/batch1/features.tsv.gz", col_names = c("gRNA_id", "gRNA_name", "sequencing_type"))
+features_tsv$gRNA <- as.numeric(rownames(features_tsv))
+features_tsv_guides <- features_tsv[features_tsv$sequencing_type == "CRISPR Guide Capture", ]
+cleanser_posterior <- merge(x = cleanser_posterior, y = features_tsv_guides, all.x = TRUE, by = "gRNA")
+
+# CRISPR guide capture UMI counts
+crispr_counts <- mats[["CRISPR Guide Capture"]] %>% as.matrix()
+barcode_df <- data.frame(cell = seq_along(colnames(crispr_counts)), cell_barcode = colnames(crispr_counts), stringsAsFactors = FALSE)
+cleanser_posterior <- merge(x = cleanser_posterior, y = barcode_df, all.x = TRUE, by = "cell")
+cleanser_posterior$gRNA_name_cell_barcode <- paste0(cleanser_posterior$gRNA_name, "_", cleanser_posterior$cell_barcode)
+
+# Adding UMI counts
+crispr_counts_df <- as.data.frame(crispr_counts)
+cell_barcodes <- colnames(crispr_counts_df)
+crispr_counts_df <- crispr_counts_df %>% rownames_to_column(var = "gRNA")
+crispr_counts_df <- crispr_counts_df %>% tidyr::pivot_longer(cols = all_of(cell_barcodes), names_to = "cell_barcode", values_to = "UMI")
+crispr_counts_df$gRNA_name_cell_barcode <- paste0(crispr_counts_df$gRNA, "_", crispr_counts_df$cell_barcode)
+crispr_counts_df$gRNA <- NULL
+crispr_counts_df$cell_barcode <- NULL
+cleanser_posterior <- merge(x = cleanser_posterior, y = crispr_counts_df, all.x = TRUE, by = "gRNA_name_cell_barcode")
+```
+
+```{r}
+# Filtering for high-likelihood gRNA calls with posterior probability >= 0.5
+cleanser_posterior_filt <- cleanser_posterior[cleanser_posterior$posterior_probability >= 0.5, ]
+
+# Grouping and counting how many gRNAs per cell
+cleanser_posterior_gb <- cleanser_posterior_filt %>% dplyr::group_by(cell_barcode) %>% 
+  dplyr::summarise(
+    num_features = n(),
+    feature_call = paste(unique(gRNA_name), collapse = "|"),
+    num_umis = paste(unique(UMI), collapse = "|")
+  )
+
+zero_cells <- so@meta.data %>% rownames_to_column(var = "cell_barcode")
+zero_cells <- zero_cells[!zero_cells$cell_barcode %in% cleanser_posterior_gb$cell_barcode, ] %>% dplyr::pull(cell_barcode)
+
+grna.calls.zero <- data.frame(cell_barcode = zero_cells,
+                              num_features = rep(0, length(zero_cells)),
+                              feature_call = rep("None", length(zero_cells)))
+cleanser_posterior_gb <- dplyr::bind_rows(list(cleanser_posterior_gb, grna.calls.zero))
+cleanser_posterior_gb$cell_barcode_num_features_gRNA <- paste0(cleanser_posterior_gb$cell_barcode, "_", cleanser_posterior_gb$num_features, "_", cleanser_posterior_gb$feature_call)
+print(length(unique(cleanser_posterior_gb$cell_barcode_num_features_gRNA)))
+```
+
+## 2.2 UMI Cutoff >= 5
+
+```{r}
+# Using an old-school >5 UMI threshold for calling gRNAs per cell
+cleanser_posterior_filt <- cleanser_posterior[cleanser_posterior$UMI >= 5, ]
+
+# Grouping and counting how many gRNAs per cell
+cleanser_posterior_5 <- cleanser_posterior_filt %>% dplyr::group_by(cell_barcode) %>% 
+  dplyr::summarise(
+    num_features = n(),
+    feature_call = paste(unique(gRNA_name), collapse = "|"),
+    num_umis = paste(unique(UMI), collapse = "|")
+  )
+
+zero_cells <- so@meta.data %>% rownames_to_column(var = "cell_barcode")
+zero_cells <- zero_cells[!zero_cells$cell_barcode %in% cleanser_posterior_5$cell_barcode, ] %>% dplyr::pull(cell_barcode)
+
+grna.calls.zero <- data.frame(cell_barcode = zero_cells,
+                              num_features = rep(0, length(zero_cells)),
+                              feature_call = rep("None", length(zero_cells)))
+cleanser_posterior_5 <- dplyr::bind_rows(list(cleanser_posterior_5, grna.calls.zero))
+cleanser_posterior_5$cell_barcode_num_features_gRNA <- paste0(cleanser_posterior_5$cell_barcode, "_", cleanser_posterior_5$num_features, "_", cleanser_posterior_5$feature_call)
+print(length(unique(cleanser_posterior_5$cell_barcode_num_features_gRNA)))
+```
+
+# 2.3 Default 10X CellRanger Gaussian Mixture Model
+
+```{r}
+# Importing 10X CellRanger Gaussian output for gRNA assignments 
+grna.calls <- read.csv(file = "/mnt/mass_storage1/mass_storage_projects/compass/COM-iN-none-aggr/count/protospacer_calls_per_cell.csv", row.names = 1)
+grna.calls <- grna.calls %>% rownames_to_column(var = "cell_barcode")
+grna.calls <- grna.calls %>% tidyr::separate_rows(feature_call, num_umis, sep = "\\|")
+
+gRNA.names <- read.csv(file = "/mnt/mass_storage1/mass_storage_projects/compass/COM-iN-none-aggr/count/feature_reference.csv")
+gRNA.names <- gRNA.names %>% dplyr::select(id, name, sequence, target_gene_name)
+colnames(gRNA.names) <- c("feature_call", "gRNA", "gRNA_sequence", "target_gene")
+grna.calls <- merge(x = grna.calls, gRNA.names, on = "feature_call", all.x = TRUE)
+
+# Grouping and counting how many gRNAs per cell
+grna.calls <- grna.calls %>% dplyr::group_by(cell_barcode) %>% 
+  dplyr::summarise(
+    num_features = n(),
+    feature_call = paste(unique(gRNA), collapse = "|"),
+    num_umis = paste(unique(num_umis), collapse = "|")
+  )
+
+zero_cells <- so@meta.data %>% rownames_to_column(var = "cell_barcode")
+zero_cells <- zero_cells[!zero_cells$cell_barcode %in% grna.calls$cell_barcode, ] %>% dplyr::pull(cell_barcode)
+
+grna.calls.zero <- data.frame(cell_barcode = zero_cells,
+                              num_features = rep(0, length(zero_cells)),
+                              feature_call = rep("None", length(zero_cells)))
+grna.calls <- dplyr::bind_rows(list(grna.calls, grna.calls.zero))
+grna.calls$cell_barcode_num_features_gRNA <- paste0(grna.calls$cell_barcode, "_", grna.calls$num_features, "_", grna.calls$feature_call)
+print(length(unique(grna.calls$cell_barcode_num_features_gRNA)))
+```
+
+
+
+# 3. Vizualizing overlapping gRNA calls per method
+
+```{r}
+# Venn diagram
+x3 <- list("CLEANSER" = cleanser_posterior_gb$cell_barcode_num_features_gRNA,
+          "CellRanger" = grna.calls$cell_barcode_num_features_gRNA,
+          "5-UMI-Cutoff" = cleanser_posterior_5$cell_barcode_num_features_gRNA)
+
+# Plotting 3-way overlap
+gg_venn_3 <- ggVennDiagram(x3) + scale_fill_gradient(low="grey90",high = "red")
+print(gg_venn_3)
+
+# Plotting 2-way overlap
+x2 <- list("CLEANSER" = cleanser_posterior_gb$cell_barcode_num_features_gRNA,
+          "CellRanger" = grna.calls$cell_barcode_num_features_gRNA)
+gg_venn_2 <- ggVennDiagram(x2) + scale_fill_gradient(low="grey90",high = "red")
+print(gg_venn_2)
+
+# Saving the plots
+#ggsave(plot = gg_venn_3, filename = "CLEANSER/cleanser_venn_3.png", width = 2000, height = 2000, dpi = 300, units = "px", bg = "white")
+#ggsave(plot = gg_venn_2, filename = "CLEANSER/cleanser_venn_2.png", width = 2000, height = 2000, dpi = 300, units = "px", bg = "white")
+```
+
+
+
+```{r}
+# Histogram
+umi_hist <- crispr_counts_df %>% dplyr::filter(UMI > 1) %>% 
+  ggplot(aes(x = UMI)) + 
+  geom_histogram(binwidth = 0.005, color = "#80e5ff") + 
+  geom_vline(xintercept = 5, linetype = "dashed", color = "red") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks() + 
+  scale_y_continuous(expand = c(0, 0)) + 
+  coord_cartesian(ylim = c(0, 1000)) +  #xlim = c(0, 10000),
+  theme_classic()
+print(umi_hist)
+
+# Saving the plot
+#ggsave(plot = umi_hist, filename = "CLEANSER/cleanser_umi_histogram.pdf", width = 3000, height = 2000, dpi = 300, units = "px")
+```
+
+```{r}
+
+```
+
+
+

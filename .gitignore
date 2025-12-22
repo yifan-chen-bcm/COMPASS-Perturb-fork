@@ -7,3 +7,10 @@ mixscale_training
 .Rhistory
 iNeuron_gRNA_DEGs/*.qs2
 iPSC_gRNA_DEGs/*.qs2
+CLEANSER/matrix.mtx
+CLEANSER/posteriors-output
+CLEANSER/posteriors-output.csv
+CLEANSER/sample-output
+CLEANSER/sample-output.csv
+iNeuron_target_DEGs/*.qs2
+NDD_iNeuron_gRNA_DEGs/*.qs2

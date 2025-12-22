@@ -8,7 +8,7 @@ library(Mixscale)
 library(DropletUtils)
 library(SingleCellExperiment)
 library(gprofiler2)
-library(presto)
+
 
 # Setting the file path to the 10X files
 dir_10x <- "/mnt/mass_storage1/mass_storage_projects/compass/"
@@ -16,13 +16,13 @@ dir_10x <- "/mnt/mass_storage1/mass_storage_projects/compass/"
 
 
 # Reading in the processed seurat objects
-so <- qs_read(file = paste0(dir_10x, "seurat_objects/2_iPSC_Mixscale.qs2"))
-
+so <- qs_read(file = paste0(dir_10x, "seurat_objects/2_iNeuron_Mixscale.qs2"))
+meta <- so@meta.data
 
 
 # Getting a list of perturbations per gRNA
 gRNA_PRTBs <- sort(unique(so$NT_gRNA))
-gRNA_PRTBs <- gRNA_PRTBs[gRNA_PRTBs != "non-targeting"]
+gRNA_PRTBs <- gRNA_PRTBs[gRNA_PRTBs != "Non-targeting"]
 
 
 
@@ -48,7 +48,7 @@ de_res_gRNA <- Mixscale::Run_wmvRegDE(object = so,   #so or so_small
                                       assay = "RNA", 
                                       slot = "counts",
                                       labels = "NT_gRNA", 
-                                      nt.class.name = "non-targeting",
+                                      nt.class.name = "Non-targeting",
                                       PRTB_list = gRNA_PRTBs,  #gRNA_PRTBs or gRNA_PRTBs_filt
                                       logfc.threshold = 0,
                                       split.by = NULL,
@@ -60,8 +60,8 @@ de_res_gRNA <- Mixscale::Run_wmvRegDE(object = so,   #so or so_small
 # Saving the output
 print("Done with differential expression - saving output DEG list!")
 #export_filename <- as.character(args[8])
-export_filename <- "iPSC_DEGs"
-qs_save(object = de_res_gRNA, file = paste0("iPSC_gRNA_DEGs/", export_filename, ".qs2"))
+export_filename <- "iNeuron_Mixscale_DEGs"
+qs_save(object = de_res_gRNA, file = paste0("iNeuron_gRNA_DEGs/", export_filename, ".qs2"))
 
 
 
