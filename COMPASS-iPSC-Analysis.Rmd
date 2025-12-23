@@ -1,7 +1,7 @@
 ---
 title: "COMPASS-iPSC-Analysis"
 author: "Yifan Chen"
-date: "2025-12-18"
+date: "2025-12-22"
 output: html_documentgunz
 ---
 
@@ -27,6 +27,8 @@ library(patchwork)
 library(progress)
 library(utils)
 library(Matrix)
+library(ggVennDiagram)
+library(DoubletFinder)
 
 # 10X Cell Ranger Output location
 dir_10x <- "C:/Users/rdhin/Yifan/COMPASS-Perturb-fork/data/COM-iP-none-aggr"
@@ -35,68 +37,615 @@ dir_10x <- "C:/Users/rdhin/Yifan/COMPASS-Perturb-fork/data/COM-iP-none-aggr"
 
 # 1. Unzip the 10x Cell Ranger Output
 
+In 10x cellranger non-aggregation output folder, unzip crispr_analysis.tar.gz and filtered_feature_bc_matrix.tar.gz into CRISPR_count and 10x_matrix_count folder
+
+# 2. Import 10x output into matrix
+
 ```{r}
-# Unzip crispr_analysis tar file
-crispr_tar_file <- file.path(dir_10x, "count/crispr_analysis.tar.gz")
-crispr_out_dir <- file.path(dir_10x, "count/CRISPR_count")
+mats <- Read10X(data.dir = "C:/Users/rdhin/Yifan/COMPASS-Perturb-fork/data/COM-iP-none-aggr/count/10x_matrix_count/")
+print(names(mats))
 
-if (!dir.exists(crispr_out_dir)) dir.create(crispr_out_dir, recursive = TRUE)
+# Building the seurat object with gene expression and CRISPR guide capture as a secondary assay
+so <- CreateSeuratObject(counts = mats[["Gene Expression"]], assay = "RNA")
+so[["CRISPR"]] <- CreateAssayObject(counts = mats[["CRISPR Guide Capture"]])
+DefaultAssay(so) <- "RNA"
 
-wsl_cmd <- sprintf(
-  "wsl tar -zxvf $(wslpath '%s') -C $(wslpath '%s')",
-  crispr_tar_file, 
-  crispr_out_dir
-)
+qs_save(object = so, file = paste0(getwd(), "/data/0_COMPASS-iPSC-no-processing.qs2"))
 
-# Unzip filtered_feature_bc_matrix tar file
-matrix_tar_file <- file.path(dir_10x, "count/filtered_feature_bc_matrix.tar.gz")
-matrix_out_dir <- file.path(dir_10x, "count/10x_matrix_count")
-
-if (!dir.exists(matrix_out_dir)) dir.create(matrix_out_dir, recursive = TRUE)
-
-wsl_cmd <- sprintf(
-  "wsl tar -zxvf $(wslpath '%s') -C $(wslpath '%s')",
-  matrix_tar_file, 
-  matrix_out_dir
-)
-
-rm(matrix_tar_file)
-rm(crispr_tar_file)
-rm(matrix_out_dir)
-
-system(wsl_cmd)
 ```
 
 # 2. Run CLEANSER to filter ambient gRNA
      https://www.cell.com/cell-genomics/fulltext/S2666-979X(25)00022-9 / https://github.com/Gersbachlab-Bioinformatics/CLEANSER
 
-```{r}
-mtx <- readMM(paste0(dir_10x ,"/count/10x_matrix_count/matrix.mtx.gz"))
-dim(mtx)
+```{bash}
+**!!! DONT RUN THIS CODE IN RMD**
+## Run this code in Windows WSL inside 10x_matrix_countr directory to convert 10x cell ranger output into clean matrix for CLEANSER
+mkdir CLEANSER
+cr2cleanser -m matrix.mtx.gz -f features.tsv.gz -o ./CLEANSER/cleanser_input.mtx
 
-features <- read.table(paste0(dir_10x ,"/count/10x_matrix_count/features.tsv.gz"), header = FALSE, sep = "\t")
-dim(features)
-barcode <- read.table(paste0(dir_10x ,"/count/10x_matrix_count/barcodes.tsv.gz"), header = FALSE, sep = "\t")
-dim(barcode)
+## Run CLEANSER
+cleanser -i ./CLEANSER/cleanser_input.mtx --posteriors-output CLEANSER/posteriors-output --samples-output CLEANSER/sample-output --seed 67 --parallel-runs 10 --direct-capture
 
+# Run time ~1 hour for COMPASS-iPSC dataset
 
-mtx1 <- readMM(paste0(dir_10x ,"/count/10x_matrix_count/input.mtx"))
-dim(mtx1)
 ```
 
 
-- Run this code in Windows WSL inside $matrix_out_dir directory to convert 10x cell ranger output into clean matrix for CLEANSER
+# 3. Analyzing CLEANSER output
 
-$     cr2cleanser -m matrix.mtx.gz -f features.tsv.gz -o cleanser_input.mtx
+```{r}
+# The posterior matrix generated from CLEANSER is a list of gRNA-cell-probability
+cleanser_posterior <- read.csv("./data/COM-iP-none-aggr/count/10x_matrix_count/CLEANSER/posteriors-output", sep = "\t", header = F, skip = 1)
+colnames(cleanser_posterior) <- c("gRNA", "cell", "posterior_probability")
+
+# gRNA info from feature.tsv.gz
+features_tsv <- read_tsv(file ="./data/COM-iP-none-aggr/count/10x_matrix_count/features.tsv.gz", col_names = c("gRNA_id", "gRNA_name", "sequencing_type"))
+features_tsv$gRNA <- as.numeric(rownames(features_tsv))
+features_tsv_guides <- features_tsv[features_tsv$sequencing_type == "CRISPR Guide Capture", ]
+cleanser_posterior <- merge(x = cleanser_posterior, y = features_tsv_guides, all.x = TRUE, by = "gRNA")
+
+# CRISPR guide capture UMI counts
+crispr_counts <- mats[["CRISPR Guide Capture"]] %>% as.matrix()
+barcode_df <- data.frame(cell = seq_along(colnames(crispr_counts)), cell_barcode = colnames(crispr_counts), stringsAsFactors = FALSE) # this generate cell number
+cleanser_posterior <- merge(x = cleanser_posterior, y = barcode_df, all.x = TRUE, by = "cell")
+cleanser_posterior$gRNA_name_cell_barcode <- paste0(cleanser_posterior$gRNA_name, "_", cleanser_posterior$cell_barcode) # this create a search
+
+# Adding UMI counts
+crispr_counts_df <- as.data.frame(crispr_counts)
+cell_barcodes <- colnames(crispr_counts_df)
+crispr_counts_df <- crispr_counts_df %>% rownames_to_column(var = "gRNA")
+crispr_counts_df <- crispr_counts_df %>% tidyr::pivot_longer(cols = all_of(cell_barcodes), names_to = "cell_barcode", values_to = "UMI")
+crispr_counts_df$gRNA_name_cell_barcode <- paste0(crispr_counts_df$gRNA, "_", crispr_counts_df$cell_barcode)
+crispr_counts_df$gRNA <- NULL
+crispr_counts_df$cell_barcode <- NULL
+cleanser_posterior <- merge(x = cleanser_posterior, y = crispr_counts_df, all.x = TRUE, by = "gRNA_name_cell_barcode")
 
 
-- Run CLEANSER
+## Filtering for high-likelihood gRNA calls with posterior probability >= 0.5
+cleanser_posterior_filt <- cleanser_posterior[cleanser_posterior$posterior_probability >= 0.5, ]
 
-$     cleanser -i cleanser_input.mtx -o cleanser_probabilities.csv --dc
+# Grouping and counting how many gRNAs per cell
+cleanser_posterior_5 <- cleanser_posterior_filt %>% dplyr::group_by(cell_barcode) %>% 
+  dplyr::summarise(
+    num_features = n(),
+    feature_call = paste(unique(gRNA_name), collapse = "|"),
+    num_umis = paste(unique(UMI), collapse = "|")
+  )
 
-- Run CLEANSER Quality Control
+# This step is to include all cells back to the dataframe, including cells are not recognized to have a guide by CLEANSER
+zero_cells <- so@meta.data %>% rownames_to_column(var = "cell_barcode")
+zero_cells <- zero_cells[!zero_cells$cell_barcode %in% cleanser_posterior_5$cell_barcode, ] %>% dplyr::pull(cell_barcode)
 
-$     mkdir -p cleanser_qc
-$     cleanser_qc -i cleanser_probabilities.csv -o ./cleanser_qc
+grna.calls.zero <- data.frame(cell_barcode = zero_cells,
+                              num_features = rep(0, length(zero_cells)),
+                              feature_call = rep("None", length(zero_cells)))
+cleanser_posterior_5 <- dplyr::bind_rows(list(cleanser_posterior_5, grna.calls.zero))
+cleanser_posterior_5$cell_barcode_num_features_gRNA <- paste0(cleanser_posterior_5$cell_barcode, "_", cleanser_posterior_5$num_features, "_", cleanser_posterior_5$feature_call)
+print(length(unique(cleanser_posterior_5$cell_barcode_num_features_gRNA)))
+
+```
+
+# 4. gRNA summary statistics - assignment by CLEANSER
+
+```{r}
+gRNA_summary <- cleanser_posterior_5 %>% dplyr::select(cell_barcode, num_features, feature_call)
+num.grna.calls <- table(gRNA_summary$num_features) %>% 
+  enframe(name = "num_gRNAs", value = "Count")
+
+num.grna.calls$Count <- as.numeric(num.grna.calls$Count)
+
+# >5 gRNA calls
+num.5.grna.calls <- num.grna.calls[!num.grna.calls$num_gRNAs %in% c("0", "1", "2", "3", "4"), ] 
+num.5.grna.calls <- sum(num.5.grna.calls$Count)
+
+# Merging
+num.grna.calls <- num.grna.calls %>% dplyr::filter(num_gRNAs %in% c("0", "1", "2", "3", "4")) %>% add_case(num_gRNAs = ">5", Count = num.5.grna.calls) 
+num.grna.calls$num_gRNAs <- factor(num.grna.calls$num_gRNAs, levels = c("0", "1", "2", "3", "4", ">5"))
+
+# Plotting
+num.grna.hist.cleanser <- num.grna.calls %>% ggplot(aes(x = num_gRNAs, y = Count)) + 
+  geom_bar(stat = "identity") + 
+  geom_text(aes(label = Count), vjust = -0.5) + 
+  scale_y_continuous(expand = c(0, 0)) +
+  expand_limits(y = max(num.grna.calls$Count) * 1.1) +
+  labs(x = "Number of gRNAs per cell", y = "Number of cells", title = "Number of gRNA Assignments per Cell by CLEANSER: iPSCs") + 
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(num.grna.hist.cleanser)
+
+ggsave(plot = num.grna.hist.cleanser, filename = "iPSC_figures_fork/CLEANSER_guide_counts_histogram.png", width = 3000, height = 2000, units = "px", dpi = 300)
+```
+
+# 5. gRNA summary statistics - assignment by Cell Ranger
+
+```{r}
+gRNA_summary.cellranger <- read.csv(file = paste0(dir_10x, "/count/CRISPR_count/protospacer_calls_per_cell.csv"), row.names = 1)
+
+num.grna.calls.cellranger <- table(gRNA_summary.cellranger$num_features) %>% 
+  enframe(name = "num_gRNAs", value = "Count")
+num.grna.calls.cellranger$Count <- as.numeric(num.grna.calls.cellranger$Count)
+num.grna.calls.cellranger <- num.grna.calls.cellranger %>% add_case(num_gRNAs = "0", Count = (nrow(so@meta.data) - sum(num.grna.calls.cellranger$Count))) 
+
+# >5 gRNA calls
+num.5.grna.calls.cellranger <- num.grna.calls.cellranger[!num.grna.calls.cellranger$num_gRNAs %in% c("0", "1", "2", "3", "4"), ] 
+num.5.grna.calls.cellranger <- sum(num.5.grna.calls.cellranger$Count)
+
+# Merging
+num.grna.calls.cellranger <- num.grna.calls.cellranger %>% dplyr::filter(num_gRNAs %in% c("0", "1", "2", "3", "4")) %>% add_case(num_gRNAs = ">5", Count = num.5.grna.calls.cellranger) 
+num.grna.calls.cellranger$num_gRNAs <- factor(num.grna.calls.cellranger$num_gRNAs, levels = c("0", "1", "2", "3", "4", ">5"))
+
+# Plotting
+num.grna.hist.cellranger <- num.grna.calls.cellranger %>% ggplot(aes(x = num_gRNAs, y = Count)) + 
+  geom_bar(stat = "identity") + 
+  geom_text(aes(label = Count), vjust = -0.5) + 
+  scale_y_continuous(expand = c(0, 0)) +
+  expand_limits(y = max(num.grna.calls.cellranger$Count) * 1.1) +
+  labs(x = "Number of gRNAs per cell", y = "Number of cells", title = "Number of gRNA Assignments per Cell by CellRanger: iPSCs") + 
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(num.grna.hist.cellranger)
+
+ggsave(plot = num.grna.hist.cellranger, filename = "iPSC_figures_fork/CellRanger_guide_counts_histogram.png", width = 3000, height = 2000, units = "px", dpi = 300)
+```
 
 
+# 6. Compare CLEANSER and CellRanger gRNA assignment for single gRNA carrying cells
+
+```{r}
+# Get cell barcode and assignment from CLEANSER
+cleanser_gRNA_barcode <- cleanser_posterior_5 %>% dplyr::select(cell_barcode, num_features)
+
+# Get cell barcode and assignment from CellRanger and fill all the zeros
+cellranger_gRNA_barcode <- gRNA_summary.cellranger %>% rownames_to_column(var = "cell_barcode") %>% dplyr::select(cell_barcode, num_features)
+missing_barcodes <- setdiff(cleanser_gRNA_barcode$cell_barcode, cellranger_gRNA_barcode$cell_barcode)
+zero_cells_cellranger <- data.frame(
+  cell_barcode = missing_barcodes,
+  num_features = 0
+)
+
+cellranger_gRNA_barcode <- dplyr::bind_rows(cellranger_gRNA_barcode, zero_cells_cellranger)
+
+# Comparing between CLEANSER and CellRanger output
+gRNA_assignment_comparison <-  full_join(
+    cleanser_gRNA_barcode %>% dplyr::rename(cleanser_count = num_features), 
+    cellranger_gRNA_barcode %>% dplyr::rename(cellranger_count = num_features), 
+    by = "cell_barcode"
+  ) %>%
+  mutate(
+    CLEANSER_features = ifelse(cleanser_count >= 3, "3+", as.character(cleanser_count)),
+    CellRanger_features = ifelse(cellranger_count >= 3, "3+", as.character(cellranger_count))
+  )
+
+
+gRNA_assignment_heatmap_data <- gRNA_assignment_comparison %>%
+  dplyr::count(CLEANSER_features, CellRanger_features)
+
+gRNA_assignment_heatmap <- ggplot(gRNA_assignment_heatmap_data, aes(x = CLEANSER_features, y = CellRanger_features, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), color = "black") +
+  scale_fill_gradient(low = "#ebf5fb", high = "#2e86c1") +
+  labs(x = "gRNAs per cell assigned by CLEANSER", y = "gRNAs per cell assigned by CellRanger", title = "gRNA Assignment - CellRanger vs CLEANSER") +
+  theme_minimal()+
+  theme(legend.position = "none", axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12, margin = margin(r = 10)))
+
+print(gRNA_assignment_heatmap)
+ggsave(plot = gRNA_assignment_heatmap, filename = "iPSC_figures_fork/gRNA_assignment_heatmap.png", width = 3000, height = 2000, units = "px", dpi = 300)
+
+```
+
+
+# 7. 10X Data Pre-processing and QC
+
+```{r}
+# Adding mitochondrial counts metadata
+so[["percent.mt"]] <- PercentageFeatureSet(so, pattern = "^MT-")
+VlnPlot(so, features = c("nFeature_RNA", "percent.mt"), ncol = 2, pt.size = 0) 
+
+# For nFeature filter, we use cells between 2000~10000 nFeatures
+
+# nFeatures
+p1 <- VlnPlot(object = so, 
+              features = c("nFeature_RNA"),
+              pt.size = 0, 
+              cols = c("#037bfc", "#037bfc", "#037bfc")) +
+  NoLegend() +
+  geom_hline(yintercept = 10000, linetype = "dashed", color = "red")+
+  geom_hline(yintercept = 2000, linetype = "dashed", color = "red")+
+  theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank())+
+  xlab(NULL)
+
+# percent mitochondrial RNA
+p2 <- VlnPlot(object = so, 
+              features = c("percent.mt"),
+              pt.size = 0, 
+              cols = c("#037bfc", "#037bfc", "#037bfc")) +
+  NoLegend() +
+  geom_hline(yintercept = 15, linetype = "dashed", color = "red")+ # here we use 15% MT DNA cutoff
+  theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank())+
+  xlab(NULL)
+
+
+# Filtering plots
+qc_filtering_plot <- p1 | p2
+print(qc_filtering_plot)
+ggsave(plot = qc_filtering_plot, filename = "iPSC_figures_fork/QC_metrics_after_filtering.png", width = 2200, height = 1500, units = "px", dpi = 300)
+
+## Check FeatureScatter
+plot1 <- FeatureScatter(so, feature1 = "nFeature_RNA", feature2 = "percent.mt") +NoLegend() + 
+  geom_vline(xintercept = 2000, linetype = "dashed", color = "blue") + 
+  geom_hline(yintercept = 15, linetype = "dashed", color = "blue")
+
+plot2 <- FeatureScatter(so, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +NoLegend()
+
+qc_scatter <- plot1 + plot2
+print(qc_scatter)
+
+ggsave(plot = qc_scatter, filename = "iPSC_figures_fork/qc_scatter_after_filtering.png", width = 3500, height = 1500, units = "px", dpi = 300)
+
+
+# Subset the cells passed the cutoff filter
+so <- subset(so, subset = nFeature_RNA > 2000 & nFeature_RNA < 10000 & percent.mt < 15)
+
+```
+
+
+# 8. DoubletFinder
+
+```{r}
+# Find 10x lanes -  DoubletFinder needs to run on separate lanes
+so$Lane <- sapply(strsplit(colnames(so), "-"), tail, 1)
+table(so$Lane)
+
+# Split the object by lane
+seu_list <- SplitObject(so, split.by = "Lane")
+
+# For each lane, run DoubletFinder
+for (i in 1:length(seu_list)) {
+  
+  # Get current lane
+  seu_lane <- seu_list[[i]]
+  print(paste("Processing Lane:", unique(seu_lane$Lane)))
+  
+  # Pre-process individually
+  seu_lane <- NormalizeData(seu_lane)
+  seu_lane <- FindVariableFeatures(seu_lane)
+  seu_lane <- ScaleData(seu_lane)
+  seu_lane <- RunPCA(seu_lane)
+  seu_lane <- RunUMAP(seu_lane, dims = 1:50) # Use PC 1-50, tested to retain more single gRNA cells compared to 10 PC
+  
+  
+  # Sweep for pK value
+  sweep.res <- paramSweep(seu_lane, PCs = 1:50, sct = FALSE)
+  sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+  pK_optimal <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+  
+  # Expected Doublet Rate from 10x multiplex rate from over-loading
+  expected_rate <- 0.08 
+  nExp_poi <- round(expected_rate * ncol(seu_lane))
+  homotypic.prop <- modelHomotypic(seu_lane@meta.data$seurat_clusters) # using Homotypic Doublet estimate
+  nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+  
+  # Run DoubletFinder
+  seu_lane <- doubletFinder(seu_lane, 
+                            PCs = 1:50, 
+                            pN = 0.25, 
+                            pK = pK_optimal, 
+                            nExp = nExp_poi.adj, 
+                            reuse.pANN = NULL, 
+                            sct = FALSE)
+  
+  # Harmonize column names
+  # Find the column indices
+  idx_class <- grep("DF.classifications", colnames(seu_lane@meta.data))
+  idx_score <- grep("pANN", colnames(seu_lane@meta.data))
+  
+  # Rename them directly
+  colnames(seu_lane@meta.data)[idx_class] <- "Doublet_Call"
+  colnames(seu_lane@meta.data)[idx_score] <- "Doublet_Score"
+    
+  # Save back to list
+  seu_list[[i]] <- seu_lane
+  
+}
+
+# Merge back into one object
+so_doublet <- merge(seu_list[[1]], y = seu_list[2:length(seu_list)])
+
+# Check results
+table(so_doublet$Doublet_Call)
+
+```
+
+# 9. Perform filtering to only retain singlet cell with single gRNA assigned by CLEANSER
+
+```{r}
+### Perform standard processing for the new object
+
+# Normalizing
+so_doublet <- NormalizeData(so_doublet, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# Finding Variable Features
+so_doublet <- FindVariableFeatures(so_doublet, selection.method = "vst", nfeatures = 2000)
+
+# Scaling
+all.genes <- rownames(so_doublet)
+so_doublet <- ScaleData(so_doublet, features = all.genes)
+
+# PCA
+so_doublet <- RunPCA(so_doublet)
+
+# Visualizations of PCA
+elbow <- ElbowPlot(so_doublet)
+print(elbow)
+ggsave(plot = elbow, filename = "iPSC_figures_fork/PCA_elbow_plot.png", height = 2000, width = 3000, units = "px", dpi = 300)
+
+pca.plot <- DimPlot(so_doublet, reduction = "pca") + NoLegend()
+print(pca.plot)
+
+# Clustering the cells with UMAP
+so_doublet <- FindNeighbors(so_doublet, dims = 1:15)  # 15 PCs from elbowplot
+so_doublet <- FindClusters(so_doublet, resolution = 1, algorithm = 4, verbose = FALSE)  #resolution optimal from 0.4-1.2. algorithm = Leiden (4), 1 = Louvain
+so_doublet <- RunUMAP(so_doublet, dims = 1:15)
+
+
+
+# Add CLEANSER guide data back to the seurat object
+rownames(gRNA_summary) <- gRNA_summary$cell_barcode
+so_doublet <- AddMetaData(
+  object = so_doublet, 
+  metadata = gRNA_summary$num_features,
+  col.name = "gRNA_counts"
+)
+
+so_doublet <- AddMetaData(
+  object = so_doublet, 
+  metadata = gRNA_summary$feature_call,
+  col.name = "gRNA_name"
+)
+
+
+# Plot UMAP
+umap_doublet <- DimPlot(so_doublet, reduction = "umap", group.by = "Doublet_Call") + ggtitle("Doublet Classification")
+ggsave(plot = umap_doublet, filename = "iPSC_figures_fork/UMAP_plot_doublet.png", height = 2000, width = 3000, units = "px", dpi = 300)
+
+# Sanity check - is there one guide that has more doublet than other?
+so_test <- subset(so_doublet, subset = gRNA_counts == 1)
+so_test$target_gene_name <- sub("-[^-]+$", "", so_test$gRNA_name)
+
+chi_test <- chisq.test(table(so_test$target_gene_name, so_test$Doublet_Call))
+
+if (chi_test$p.value >= 0.05) {
+  print("No difference in doublet detection")
+} else {
+  print("Doublet detection is significantly different among guides, please check!!")
+}
+
+
+# Subset the seurat object to only contain singlet and single guide cells
+so_filter <- subset(so_doublet, subset = gRNA_counts == 1 & Doublet_Call == "Singlet")
+
+# Create a new column that has target gene name
+so_filter$target_gene_name <- sub("-[^-]+$", "", so_filter$gRNA_name)
+
+# Re-run the standard processing
+so_filter <- NormalizeData(so_filter, normalization.method = "LogNormalize", scale.factor = 10000)
+so_filter <- FindVariableFeatures(so_filter, selection.method = "vst", nfeatures = 2000)
+all.genes <- rownames(so_filter)
+so_filter <- ScaleData(so_filter, features = all.genes)
+so_filter <- RunPCA(so_filter)
+elbow <- ElbowPlot(so_filter)
+print(elbow)
+ggsave(plot = elbow, filename = "iPSC_figures_fork/PCA_elbow_plot.png", height = 2000, width = 3000, units = "px", dpi = 300)
+so_filter <- FindNeighbors(so_filter, dims = 1:15)  # 15 PCs from elbowplot
+so_filter <- FindClusters(so_filter, resolution = 1, algorithm = 4, verbose = FALSE)  #resolution optimal from 0.4-1.2. algorithm = Leiden (4), 1 = Louvain
+so_filter <- RunUMAP(so_filter, dims = 1:15)
+
+umap_target_gene <- DimPlot(so_filter, reduction = "umap", group.by = "target_gene_name") + ggtitle("UMAP by Target Gene")
+ggsave(plot = umap_target_gene, filename = "iPSC_figures_fork/UMAP_plot_by_target_gene.png", height = 2000, width = 3000, units = "px", dpi = 300)
+
+
+# Run ICA with tSNE
+so_filter <- RunICA(so_filter, features = VariableFeatures(so_filter), nics = 50)
+so_filter <- RunTSNE(so_filter, reduction = "ica", dims = 1:30)
+tSNE <- DimPlot(so_filter, reduction = "tsne", group.by = "target_gene_name") + ggtitle("t-SNE by Target Gene")
+ggsave(plot = tSNE, filename = "iPSC_figures_fork/tSNE_plot_by_target_gene.png", height = 2000, width = 3000, units = "px", dpi = 300)
+
+# Save the seurat object
+qs_save(object = so_filter, file = paste0(getwd(), "/data/1_COMPASS-iPSC-CLEANSER-DoubletFinder-filter.qs2"))
+
+```
+
+# 10. Check NTC guides off-target
+
+```{r}
+# Load saved qs2 object
+so_filter <- qs_read(file = paste0(getwd(), "/data/1_COMPASS-iPSC-CLEANSER-DoubletFinder-filter.qs2"))
+
+```
+
+## 10.1 Pairwise Spearman Correlation
+```{r}
+
+so_ntc <- subset(so_filter, subset = target_gene_name == "NTC")
+
+list_of_NT_gRNA <- unique(so_ntc@meta.data$gRNA_name)
+Idents(so_ntc) <- "gRNA_name"
+# set the order correct
+ntc_guides <- str_sort(unique(so_ntc@meta.data$gRNA_name), numeric = TRUE)
+
+# calculate average gene expression of all cells receiving the same guide
+avg_expression <- AggregateExpression(so_ntc, assays = "RNA", slot = "data")$RNA
+
+# find variable features, default 2000
+so_ntc <- FindVariableFeatures(so_ntc, nfeatures = 2000)
+genes_to_use <- VariableFeatures(so_ntc)
+avg_expression_subset <- avg_expression[genes_to_use, ]
+
+cor_mat <- cor(as.matrix(avg_expression_subset), method = "spearman")
+cor_mat <- cor_mat[ntc_guides, ntc_guides] # set order of the matrix
+
+# plot spearman correlation
+
+ntc_spearman_cor <- pheatmap(
+  cor_mat, 
+  main = "Spearman Correlation of NT Guides",
+  display_numbers = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(0.85, 1, length.out = 101),
+  cluster_rows = FALSE, 
+  cluster_cols = FALSE
+)
+
+
+ggsave(filename = "iPSC_figures_fork/NTC_Spearman_Correlation.png", plot = ntc_spearman_cor, width = 2000, height = 1500, dpi = 300, units = "px")
+
+```
+
+## 10.2 Perform Wilcox test between one NTC and the rest of NTCs
+
+```{r}
+# empty list to store all results
+ntc_rest_deg_list <- list()
+
+for (id in ntc_guides) {
+  message(paste("Processing:", id, "vs remaining NTCs..."))
+  
+  cells_1 <- WhichCells(so_ntc, idents = id)
+  n_cells <- length(cells_1)
+  
+  rest_of_ntcs <- setdiff(ntc_guides, id)
+  cells_2_pool <- WhichCells(so_ntc, idents = rest_of_ntcs)
+
+  # Perform downsampling on the rest of NTCs cells to be 1.5x of the specific guide cell counts
+  cells_2_downsampled <- sample(cells_2_pool, size = 1.5*n_cells)
+  
+  try({
+    markers <- FindMarkers(
+      so_ntc,
+      ident.1 = cells_1,
+      ident.2 = cells_2_downsampled,
+      logfc.threshold = 0,
+      test.use = "wilcox",
+      verbose = FALSE
+    )
+    
+    # Store the comparison ID and the gene name within the table
+    markers$Comparison <- id
+    markers$Gene <- rownames(markers)
+    
+    ntc_rest_deg_list[[id]] <- markers
+  }, silent = TRUE)
+}
+
+ntc_rest_deg <- do.call(rbind, ntc_rest_deg_list)
+
+# Perform Study-wise FDR correction
+ntc_rest_deg$study_wide_fdr <- p.adjust(ntc_rest_deg$p_val, method = "fdr")
+
+deg_counts <- ntc_rest_deg %>%
+  dplyr::filter(study_wide_fdr < 0.05) %>%  
+  dplyr::group_by(Comparison) %>%
+  dplyr::summarise(
+    Total = n()
+  )
+
+print(deg_counts)
+
+```
+## 10.3 Perform pair-wise DEG among all pairs of guides
+
+```{r}
+# Set up the comparison matrix
+deg_matrix <- matrix(0, nrow = length(ntc_guides), ncol = length(ntc_guides))
+rownames(deg_matrix) <- ntc_guides
+colnames(deg_matrix) <- ntc_guides
+
+ntc_pairs <- combn(ntc_guides, 2)
+
+results_list <- list()
+    
+for (k in 1:ncol(ntc_pairs)) {
+  i <- ntc_pairs[1, k]
+  j <- ntc_pairs[2, k]
+  
+  message(paste("Comparing:", i, "vs", j))
+  
+  # Wrap in tryCatch to handle cases where a comparison might fail
+  res <- tryCatch({
+    markers <- FindMarkers(
+      so_ntc,
+      ident.1 = i,
+      ident.2 = j,
+      logfc.threshold = 0,
+      test.use = "wilcox",
+      verbose = FALSE
+    )
+    
+    # Add metadata so you know which comparison these p-values belong to
+    markers$comparison <- paste0(i, "_vs_", j)
+    markers$gene <- rownames(markers)
+    markers
+    
+  }, error = function(e) {
+    message(paste("Error in comparison", i, "vs", j, ":", e$message))
+    return(NULL)
+  })
+  
+  results_list[[k]] <- res
+}
+
+# Perform study-wise FDR correction
+ntc_pairwise_deg <- do.call(rbind, results_list)
+ntc_pairwise_deg$fdr_study_wide <- p.adjust(ntc_pairwise_deg$p_val, method = "fdr")
+
+
+# fill matrix with significant gene counts
+for (k in 1:ncol(ntc_pairs)) {
+  i <- ntc_pairs[1, k]
+  j <- ntc_pairs[2, k]
+  
+  # Filter global results for this specific pair and significance
+  sig_genes_count <- sum(ntc_pairwise_deg$comparison == paste(i, j, sep = "_vs_") & 
+                         ntc_pairwise_deg$fdr_study_wide < 0.05)
+  
+  # Fill the matrix (symmetric)
+  deg_matrix[i, j] <- sig_genes_count
+  deg_matrix[j, i] <- sig_genes_count
+}
+
+# plot the matrix
+max_degs <- max(deg_matrix, na.rm = TRUE)
+
+if (sum(deg_matrix) == 0) {
+  
+  print("No DEGs found between any guides. Skipping Heatmap.")
+
+} else {
+  heat_map <- pheatmap(
+    deg_matrix,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    display_numbers = TRUE, # Show the actual count inside the square
+    number_format = "%.0f", # No decimals
+    color = colorRampPalette(c("white", "red"))(50),
+    main = "Pairwise DEGs between NTC Guides"
+  )
+  
+  ggsave(filename = "iPSC_figures_fork/NTC_DEG_heatmap.png", plot = heat_map, width = 2000, height = 1500, dpi = 300, units = "px")
+}
+
+## check the gene of interest
+# rest_of_ntcs <- setdiff(list_of_NT_gRNA, "NTC-g8")
+# markers <- FindMarkers(
+#         so_ntc,
+#         ident.1 = "NTC-g8",
+#         ident.2 = rest_of_ntcs,
+#         min.pct = 0.1,
+#         logfc.threshold = 0.25,
+#         test.use = "wilcox",
+#         verbose = FALSE)
+```
